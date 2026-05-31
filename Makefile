@@ -3,6 +3,7 @@
 
 CC = x86_64-elf-gcc
 LD = x86_64-elf-ld
+AR = x86_64-elf-ar
 
 ifneq ($(BOREDOS_SDK),)
   ifeq ($(wildcard $(BOREDOS_SDK)/lib/libc.a),)
@@ -22,20 +23,32 @@ endif
 
 DESTDIR ?= $(abspath build/dist)
 
+BEARSSL_DIR = ../bearssl
+BEARSSL_SRCS = $(shell find $(BEARSSL_DIR)/src -name "*.c")
+BEARSSL_OBJS = $(patsubst $(BEARSSL_DIR)/src/%.c, obj/bearssl/%.o, $(BEARSSL_SRCS))
+
 CFLAGS  = -Wall -Wextra -std=gnu11 -ffreestanding -O2 -fno-stack-protector \
           -fno-stack-check -fno-lto -fno-pie -m64 -march=x86-64 -mno-red-zone \
-          -isystem $(SDK_PATH)/include
+          -isystem $(SDK_PATH)/include -I$(BEARSSL_DIR)/inc -I$(BEARSSL_DIR)/src
 
 LDFLAGS = -m elf_x86_64 -nostdlib -static -no-pie -Ttext=0x40000000 \
           --no-dynamic-linker -z text -z max-page-size=0x1000 -e _start \
           -L$(SDK_PATH)/lib
 
-UTILS = ping telnet curl net
+UTILS = ping telnet curl net httpd
 APPS  = $(patsubst %, %.elf, $(UTILS))
 
-all: bootstrap-sdk $(APPS)
+all: bootstrap-bearssl bootstrap-sdk
+	$(MAKE) apps
 
-.PHONY: bootstrap-sdk
+.PHONY: bootstrap-bearssl bootstrap-sdk apps
+
+bootstrap-bearssl:
+	@if [ ! -d "$(BEARSSL_DIR)" ]; then \
+		echo "[STANDALONE] BearSSL not found at $(BEARSSL_DIR). Cloning mirror..."; \
+		git clone https://github.com/ccxvii/bearssl.git $(BEARSSL_DIR); \
+	fi
+
 bootstrap-sdk:
 ifdef BOOTSTRAP_SDK
 	@if [ ! -f "$(BOOTSTRAP_SDK)/lib/libc.a" ]; then \
@@ -53,8 +66,24 @@ ifdef BOOTSTRAP_SDK
 	fi
 endif
 
+apps: $(APPS)
+
+curl.elf: obj/curl.o obj/libbearssl.a
+	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $< obj/libbearssl.a -lc -o $@
+
+telnet.elf: obj/telnet.o obj/libbearssl.a
+	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $< obj/libbearssl.a -lc -o $@
+
 %.elf: obj/%.o
 	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $< -lc -o $@
+
+obj/bearssl/%.o: $(BEARSSL_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+obj/libbearssl.a: $(BEARSSL_OBJS)
+	@mkdir -p obj
+	$(AR) rcs $@ $(BEARSSL_OBJS)
 
 obj/%.o: src/%.c
 	@mkdir -p obj
@@ -63,6 +92,9 @@ obj/%.o: src/%.c
 install: all
 	mkdir -p $(DESTDIR)/bin
 	cp $(APPS) $(DESTDIR)/bin/
+	mkdir -p $(DESTDIR)/etc/cert
+	if [ -d certs ]; then cp certs/*.pem $(DESTDIR)/etc/cert/; fi
+	cp index.html $(DESTDIR)/etc/index.html
 
 clean:
 	rm -rf obj build $(APPS)

@@ -1,8 +1,10 @@
 #include <stdlib.h>
 #include <syscall.h>
-#include <stdint.h> // Added for uint8_t
+#include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <string.h>
+#include <bearssl.h>
 
 static int parse_ip(const char* str, net_ipv4_address_t* ip) {
     int val = 0;
@@ -26,13 +28,350 @@ static int parse_ip(const char* str, net_ipv4_address_t* ip) {
     return 0;
 }
 
+static int sock_read(void *ctx, unsigned char *buf, size_t len) {
+    (void)ctx;
+    int r = sys_tcp_recv(buf, len);
+    if (r < 0) {
+        return -1;
+    }
+    return r;
+}
+
+static int sock_write(void *ctx, const unsigned char *buf, size_t len) {
+    (void)ctx;
+    int r = sys_tcp_send(buf, len);
+    if (r < 0) {
+        return -1;
+    }
+    return r;
+}
+
+static uint32_t rtc_to_days_since_1970(int y, int m, int d) {
+    static const int days_before_month[] = {
+        0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
+    };
+    
+    uint32_t days = (y - 1970) * 365;
+    
+    int leap_years = 0;
+    for (int year = 1970; year < y; year++) {
+        if ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)) {
+            leap_years++;
+        }
+    }
+    days += leap_years;
+    days += days_before_month[m - 1];
+    
+    if (m > 2 && ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0))) {
+        days++;
+    }
+    
+    days += (d - 1);
+    return days;
+}
+
+typedef struct {
+    const br_x509_class *vtable;
+    br_x509_minimal_context minimal;
+} dummy_x509_context;
+
+static void dummy_start_chain(const br_x509_class **ctx, const char *server_name) {
+    dummy_x509_context *dctx = (dummy_x509_context *)ctx;
+    br_x509_minimal_vtable.start_chain(&dctx->minimal.vtable, server_name);
+}
+
+static void dummy_start_cert(const br_x509_class **ctx, uint32_t length) {
+    dummy_x509_context *dctx = (dummy_x509_context *)ctx;
+    br_x509_minimal_vtable.start_cert(&dctx->minimal.vtable, length);
+}
+
+static void dummy_append(const br_x509_class **ctx, const unsigned char *buf, size_t len) {
+    dummy_x509_context *dctx = (dummy_x509_context *)ctx;
+    br_x509_minimal_vtable.append(&dctx->minimal.vtable, buf, len);
+}
+
+static void dummy_end_cert(const br_x509_class **ctx) {
+    dummy_x509_context *dctx = (dummy_x509_context *)ctx;
+    br_x509_minimal_vtable.end_cert(&dctx->minimal.vtable);
+}
+
+static unsigned dummy_end_chain(const br_x509_class **ctx) {
+    dummy_x509_context *dctx = (dummy_x509_context *)ctx;
+    (void)br_x509_minimal_vtable.end_chain(&dctx->minimal.vtable);
+    
+    if (dctx->minimal.pkey.key_type != 0) {
+        dctx->minimal.err = BR_ERR_X509_OK;
+        dctx->minimal.key_usages = BR_KEYTYPE_KEYX | BR_KEYTYPE_SIGN;
+        return 0;
+    }
+    return BR_ERR_X509_NOT_TRUSTED;
+}
+
+static const br_x509_pkey *dummy_get_pkey(const br_x509_class *const *ctx, unsigned *usages) {
+    dummy_x509_context *dctx = (dummy_x509_context *)ctx;
+    return br_x509_minimal_vtable.get_pkey(&dctx->minimal.vtable, usages);
+}
+
+static const br_x509_class dummy_x509_vtable = {
+    sizeof(dummy_x509_context),
+    dummy_start_chain,
+    dummy_start_cert,
+    dummy_append,
+    dummy_end_cert,
+    dummy_end_chain,
+    dummy_get_pkey
+};
+
+static int dummy_time_check(void *tctx,
+    uint32_t not_before_days, uint32_t not_before_seconds,
+    uint32_t not_after_days, uint32_t not_after_seconds)
+{
+    (void)tctx;
+    (void)not_before_days;
+    (void)not_before_seconds;
+    (void)not_after_days;
+    (void)not_after_seconds;
+    return 0;
+}
+static int has_rdrand(void) {
+    uint32_t eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(1));
+    return (ecx & (1U << 30)) != 0;
+}
+
+static uint64_t get_rdrand(void) {
+    uint64_t val = 0;
+    unsigned char ok = 0;
+    for (int i = 0; i < 10; i++) {
+        __asm__ volatile("rdrand %0; setc %1"
+                         : "=r"(val), "=qm"(ok));
+        if (ok) return val;
+    }
+    return 0;
+}
+
+static uint64_t get_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+static br_x509_trust_anchor *dynamic_TAs = NULL;
+static size_t dynamic_TAs_num = 0;
+
+typedef struct {
+    unsigned char *data;
+    size_t len;
+    size_t cap;
+} der_buffer;
+
+static void der_append(void *ctx, const void *src, size_t len) {
+    der_buffer *buf = (der_buffer *)ctx;
+    if (buf->len + len > buf->cap) {
+        buf->cap = (buf->cap + len) * 2 + 1024;
+        unsigned char *new_data = realloc(buf->data, buf->cap);
+        if (new_data) {
+            buf->data = new_data;
+        } else {
+            return;
+        }
+    }
+    memcpy(buf->data + buf->len, src, len);
+    buf->len += len;
+}
+
+static int clone_pkey(br_x509_pkey *dst, const br_x509_pkey *src) {
+    dst->key_type = src->key_type;
+    if (src->key_type == BR_KEYTYPE_RSA) {
+        dst->key.rsa.nlen = src->key.rsa.nlen;
+        dst->key.rsa.n = malloc(src->key.rsa.nlen);
+        if (!dst->key.rsa.n) return -1;
+        memcpy(dst->key.rsa.n, src->key.rsa.n, src->key.rsa.nlen);
+
+        dst->key.rsa.elen = src->key.rsa.elen;
+        dst->key.rsa.e = malloc(src->key.rsa.elen);
+        if (!dst->key.rsa.e) {
+            free(dst->key.rsa.n);
+            return -1;
+        }
+        memcpy(dst->key.rsa.e, src->key.rsa.e, src->key.rsa.elen);
+    } else if (src->key_type == BR_KEYTYPE_EC) {
+        dst->key.ec.curve = src->key.ec.curve;
+        dst->key.ec.qlen = src->key.ec.qlen;
+        dst->key.ec.q = malloc(src->key.ec.qlen);
+        if (!dst->key.ec.q) return -1;
+        memcpy(dst->key.ec.q, src->key.ec.q, src->key.ec.qlen);
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+static void load_dynamic_certs(void) {
+    FAT32_FileInfo entries[128];
+    int count = sys_list("/etc/cert", entries, 128);
+    if (count <= 0) {
+        printf("No certificates found in /etc/cert or folder missing.\n");
+        return;
+    }
+
+    size_t ta_capacity = 8;
+    dynamic_TAs = malloc(ta_capacity * sizeof(br_x509_trust_anchor));
+    if (!dynamic_TAs) return;
+
+    for (int idx = 0; idx < count; idx++) {
+        if (entries[idx].is_directory) continue;
+
+        const char *name = entries[idx].name;
+        size_t nlen = strlen(name);
+        if (nlen < 4 || strcmp(name + nlen - 4, ".pem") != 0) {
+            continue;
+        }
+
+        char path[512];
+        strcpy(path, "/etc/cert/");
+        strcat(path, name);
+
+        int fd = sys_open(path, "r");
+        if (fd < 0) {
+            printf("Warning: Cannot open certificate file: %s\n", path);
+            continue;
+        }
+
+        uint32_t size = entries[idx].size;
+        if (size == 0) {
+            sys_close(fd);
+            continue;
+        }
+
+        char *file_buf = malloc(size + 1);
+        if (!file_buf) {
+            sys_close(fd);
+            continue;
+        }
+
+        int read_bytes = sys_read(fd, file_buf, size);
+        sys_close(fd);
+
+        if (read_bytes <= 0) {
+            free(file_buf);
+            continue;
+        }
+        file_buf[read_bytes] = '\0';
+
+        br_pem_decoder_context pem_ctx;
+        br_pem_decoder_init(&pem_ctx);
+
+        der_buffer der = { NULL, 0, 0 };
+        br_pem_decoder_setdest(&pem_ctx, der_append, &der);
+
+        size_t pos = 0;
+        size_t file_len = (size_t)read_bytes;
+        int in_cert = 0;
+
+        while (pos < file_len) {
+            size_t consumed = br_pem_decoder_push(&pem_ctx, file_buf + pos, file_len - pos);
+            pos += consumed;
+
+            int event = br_pem_decoder_event(&pem_ctx);
+            if (event == BR_PEM_BEGIN_OBJ) {
+                const char *banner = br_pem_decoder_name(&pem_ctx);
+                if (banner && strcmp(banner, "CERTIFICATE") == 0) {
+                    in_cert = 1;
+                    der.len = 0;
+                }
+            } else if (event == BR_PEM_END_OBJ) {
+                if (in_cert && der.len > 0) {
+                    br_x509_decoder_context x509_ctx;
+                    der_buffer dn = { NULL, 0, 0 };
+                    br_x509_decoder_init(&x509_ctx, der_append, &dn);
+                    br_x509_decoder_push(&x509_ctx, der.data, der.len);
+
+                    const br_x509_pkey *pkey = br_x509_decoder_get_pkey(&x509_ctx);
+                    int err = br_x509_decoder_last_error(&x509_ctx);
+
+                    if (pkey && err == 0 && dn.len > 0) {
+                        if (dynamic_TAs_num >= ta_capacity) {
+                            ta_capacity *= 2;
+                            br_x509_trust_anchor *new_tas = realloc(dynamic_TAs, ta_capacity * sizeof(br_x509_trust_anchor));
+                            if (new_tas) {
+                                dynamic_TAs = new_tas;
+                            } else {
+                                free(dn.data);
+                                break;
+                            }
+                        }
+
+                        br_x509_trust_anchor *ta = &dynamic_TAs[dynamic_TAs_num];
+                        ta->dn.len = dn.len;
+                        ta->dn.data = malloc(dn.len);
+                        if (ta->dn.data) {
+                            memcpy(ta->dn.data, dn.data, dn.len);
+                            if (clone_pkey(&ta->pkey, pkey) == 0) {
+                                ta->flags = BR_X509_TA_CA;
+                                dynamic_TAs_num++;
+                            } else {
+                                free(ta->dn.data);
+                            }
+                        }
+                    }
+                    free(dn.data);
+                    in_cert = 0;
+                }
+            } else if (event == BR_PEM_ERROR) {
+                in_cert = 0;
+            }
+        }
+
+        free(der.data);
+        free(file_buf);
+    }
+
+    if (dynamic_TAs_num > 0) {
+        printf("Successfully loaded %d dynamic CA certificates from /etc/cert\n", (int)dynamic_TAs_num);
+    } else {
+        printf("No valid certificates loaded from /etc/cert.\n");
+        free(dynamic_TAs);
+        dynamic_TAs = NULL;
+    }
+}
+
+static void free_dynamic_certs(void) {
+    if (!dynamic_TAs) return;
+    for (size_t i = 0; i < dynamic_TAs_num; i++) {
+        free(dynamic_TAs[i].dn.data);
+        if (dynamic_TAs[i].pkey.key_type == BR_KEYTYPE_RSA) {
+            free(dynamic_TAs[i].pkey.key.rsa.n);
+            free(dynamic_TAs[i].pkey.key.rsa.e);
+        } else if (dynamic_TAs[i].pkey.key_type == BR_KEYTYPE_EC) {
+            free(dynamic_TAs[i].pkey.key.ec.q);
+        }
+    }
+    free(dynamic_TAs);
+    dynamic_TAs = NULL;
+    dynamic_TAs_num = 0;
+}
+
+static unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];
+
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        printf("Usage: curl http://a.b.c.d[:port]/path\n");
+    int insecure = 0;
+    const char* url = NULL;
+    
+    for (int idx = 1; idx < argc; idx++) {
+        if (strcmp(argv[idx], "-k") == 0 || strcmp(argv[idx], "--insecure") == 0) {
+            insecure = 1;
+        } else {
+            url = argv[idx];
+        }
+    }
+    
+    if (url == NULL) {
+        printf("Usage: curl [-k|--insecure] http(s)://a.b.c.d[:port]/path\n");
         return 1;
     }
 
-    const char* url = argv[1];
     const char* host_start = url;
     int is_https = 0;
     
@@ -45,13 +384,8 @@ int main(int argc, char** argv) {
         }
     }
     
-    if (is_https) {
-        printf("Error: HTTPS is not yet supported in BoredOS. Please use http://\n");
-        return 1;
-    }
-
     char hostname[256];
-    int port = 80;
+    int port = is_https ? 443 : 80;
     int i = 0;
     while (host_start[i] && host_start[i] != '/' && host_start[i] != ':' && i < 255) {
         hostname[i] = host_start[i];
@@ -59,7 +393,6 @@ int main(int argc, char** argv) {
     }
     hostname[i] = 0;
 
-    int host_len = i;
     if (host_start[i] == ':') {
         i++;
         char port_str[10];
@@ -94,10 +427,6 @@ int main(int argc, char** argv) {
     char request[1024];
     int req_len = 0;
     
-    // GET path HTTP/1.1
-    // Host: hostname
-    // Connection: close
-    
     char* r = request;
     char* s;
     
@@ -108,26 +437,129 @@ int main(int argc, char** argv) {
     s = "\r\nUser-Agent: BoredOS/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"; while(*s) *r++ = *s++;
     req_len = r - request;
 
-    sys_tcp_send(request, req_len);
-    
-    char buf[4096];
-    int total = 0;
-    while (1) {
-        int len = sys_tcp_recv(buf, 4095);
-        if (len < 0) {
-            printf("\n[Error: Connection closed or error]\n");
-            break;
+    if (is_https) {
+        br_ssl_client_context sc;
+        dummy_x509_context dummy_xc;
+        br_sslio_context ioc;
+
+        if (insecure) {
+            printf("Initializing SSL/TLS session (insecure verification mode)...\n");
+            br_ssl_client_init_full(&sc, &dummy_xc.minimal, NULL, 0);
+            br_x509_minimal_set_time_callback(&dummy_xc.minimal, NULL, dummy_time_check);
+
+            dummy_xc.vtable = &dummy_x509_vtable;
+            br_ssl_engine_set_x509(&sc.eng, &dummy_xc.vtable);
+        } else {
+            printf("Initializing SSL/TLS session (cryptographically secure mode)...\n"); 
+            load_dynamic_certs();
+            if (dynamic_TAs && dynamic_TAs_num > 0) {
+                br_ssl_client_init_full(&sc, &dummy_xc.minimal, dynamic_TAs, dynamic_TAs_num);
+            } else {
+                printf("No dynamic CA certificates found; TLS verification may fail. Add PEMs to /etc/cert or use -k/--insecure.\n");
+                br_ssl_client_init_full(&sc, &dummy_xc.minimal, NULL, 0);
+            }
+            int dt[6];
+            uint32_t days = 719528; // Default to Unix Epoch day
+            uint32_t seconds = 0;
+            if (sys_system(SYSTEM_CMD_RTC_GET, (uint64_t)dt, 0, 0, 0) == 0) {
+                if (dt[0] >= 1970 && dt[1] >= 1 && dt[1] <= 12 && dt[2] >= 1 && dt[2] <= 31) {
+                    days = rtc_to_days_since_1970(dt[0], dt[1], dt[2]) + 719528;
+                    seconds = dt[3] * 3600 + dt[4] * 60 + dt[5];
+                    br_x509_minimal_set_time(&dummy_xc.minimal, days, seconds);
+                } else {
+                    printf("[Warning: RTC clock uninitialized, secure date check may fail! Set system date or use -k/--insecure]\n");
+                }
+            }
         }
-        if (len == 0) break;
-        buf[len] = 0;
-        printf("%s", buf);
-        total += len;
-        if (total > 1000000) {
-            printf("\n[Error: Data limit exceeded]\n");
-            break;
+        uint64_t seed[4];
+        if (has_rdrand()) {
+            printf("Seeding secure DRBG with CPU hardware entropy (RDRAND)...\n");
+            seed[0] = get_rdrand();
+            seed[1] = get_rdrand();
+            seed[2] = get_rdrand();
+            seed[3] = get_rdrand();
+        } else {
+            printf("Warning: CPU RDRAND unsupported! Seeding secure DRBG with system ticks and RTC fallback...\n");
+            seed[0] = sys_system(SYSTEM_CMD_GET_TICKS, 0, 0, 0, 0);
+            seed[1] = (uintptr_t)&sc;
+            seed[2] = get_rdtsc();
+            seed[3] = sys_system(SYSTEM_CMD_RTC_GET, 0, 0, 0, 0);
+        }
+        br_ssl_engine_inject_entropy(&sc.eng, seed, sizeof(seed));
+        br_ssl_engine_set_buffer(&sc.eng, iobuf, sizeof(iobuf), 1);
+        if (br_ssl_client_reset(&sc, hostname, 0) == 0) {
+            printf("\n[Error: SSL client reset failed (RNG unseeded or invalid)]\n");
+            sys_tcp_close();
+            free_dynamic_certs();
+            return 1;
+        }
+        br_sslio_init(&ioc, &sc.eng, sock_read, NULL, sock_write, NULL);
+
+        printf("Performing SSL handshake...\n");
+
+        if (br_sslio_write_all(&ioc, request, req_len) != 0) {
+            int err = br_ssl_engine_last_error(&sc.eng);
+            printf("\n[Error: SSL handshake or request sending failed, error code: %d]\n", err);
+            if (err == BR_ERR_X509_NOT_TRUSTED && !insecure) {
+                printf("[Tip: Certificate was not trusted by root CA store. You can bypass using -k or --insecure option]\n");
+            }
+            sys_tcp_close();
+            free_dynamic_certs();
+            return 1;
+        }
+
+        if (br_sslio_flush(&ioc) != 0) {
+            int err = br_ssl_engine_last_error(&sc.eng);
+            printf("\n[Error: SSL stream flush failed, error code: %d]\n", err);
+            sys_tcp_close();
+            free_dynamic_certs();
+            return 1;
+        }
+
+        printf("Receiving response...\n");
+
+        char buf[4096];
+        int total = 0;
+        while (1) {
+            int len = br_sslio_read(&ioc, buf, 4095);
+            if (len < 0) {
+                break;
+            }
+            if (len == 0) break;
+            buf[len] = 0;
+            printf("%s", buf);
+            total += len;
+            if (total > 1000000) {
+                printf("\n[Error: Data limit exceeded]\n");
+                break;
+            }
+        }
+
+        br_sslio_close(&ioc);
+    } else {
+        // Plain unencrypted HTTP
+        sys_tcp_send(request, req_len);
+        
+        char buf[4096];
+        int total = 0;
+        while (1) {
+            int len = sys_tcp_recv(buf, 4095);
+            if (len < 0) {
+                printf("\n[Error: Connection closed or error]\n");
+                break;
+            }
+            if (len == 0) break;
+            buf[len] = 0;
+            printf("%s", buf);
+            total += len;
+            if (total > 1000000) {
+                printf("\n[Error: Data limit exceeded]\n");
+                break;
+            }
         }
     }
     
     sys_tcp_close();
+    free_dynamic_certs();
     return 0;
 }
