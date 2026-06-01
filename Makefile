@@ -46,7 +46,7 @@ all: bootstrap-bearssl bootstrap-sdk
 bootstrap-bearssl:
 	@if [ ! -d "$(BEARSSL_DIR)" ]; then \
 		echo "[STANDALONE] BearSSL not found at $(BEARSSL_DIR). Cloning mirror..."; \
-		git clone https://github.com/ccxvii/bearssl.git $(BEARSSL_DIR); \
+		git clone https://www.bearssl.org/git/BearSSL $(BEARSSL_DIR); \
 	fi
 
 bootstrap-sdk:
