@@ -1,3 +1,6 @@
+// Copyright (c) 2023-2026 Christiaan (chris@boreddev.nl)
+// This software is released under the GNU General Public License v3.0. See LICENSE file for details.
+// This header needs to maintain in any file it is present in, as per the GPL license terms.
 #include <stdlib.h>
 #include <syscall.h>
 #include <stdio.h>
@@ -35,9 +38,27 @@ int main(int argc, char **argv) {
         return 1;
     }
     
-    if (!sys_network_is_initialized()) {
+    char status_buf[256];
+    FILE* f = fopen("/sys/class/net/eth0/status", "r");
+    bool is_init = false;
+    if (f) {
+        int len = fread(status_buf, 1, 255, f);
+        fclose(f);
+        if (len > 0) {
+            status_buf[len] = 0;
+            if (strstr(status_buf, "initialized: 1") != NULL) {
+                is_init = true;
+            }
+        }
+    }
+    
+    if (!is_init) {
         printf("Initializing network...\n");
-        sys_network_init();
+        FILE* ctrl = fopen("/sys/class/net/eth0/control", "w");
+        if (ctrl) {
+            fwrite("init", 1, 4, ctrl);
+            fclose(ctrl);
+        }
     }
     
     const char *host = argv[1];

@@ -1,8 +1,12 @@
+// Copyright (c) 2023-2026 Christiaan (chris@boreddev.nl)
+// This software is released under the GNU General Public License v3.0. See LICENSE file for details.
+// This header needs to maintain in any file it is present in, as per the GPL license terms.
 #include <stdlib.h>
 #include <syscall.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 static void print_ip(const net_ipv4_address_t* ip) {
     if (!ip) return;
@@ -21,6 +25,8 @@ static int parse_ip(const char* str, net_ipv4_address_t* ip) {
             if (part > 3) return -1;
             ip->bytes[part++] = (uint8_t)val;
             val = 0;
+        } else if (*p == '\n' || *p == '\r' || *p == ' ') {
+            break;
         } else {
             return -1;
         }
@@ -33,30 +39,49 @@ static int parse_ip(const char* str, net_ipv4_address_t* ip) {
 
 static int resolve_host(const char* host, net_ipv4_address_t* ip) {
     if (parse_ip(host, ip) == 0) return 0;
-    // Try DNS
     return sys_dns_lookup(host, ip);
+}
+
+static int write_control(const char* cmd) {
+    FILE* f = fopen("/sys/class/net/eth0/control", "w");
+    if (!f) return -1;
+    size_t len = fwrite(cmd, 1, strlen(cmd), f);
+    fclose(f);
+    return len > 0 ? 0 : -1;
+}
+
+static int read_ip_prop(const char* file, net_ipv4_address_t* ip) {
+    char buf[64];
+    FILE* f = fopen(file, "r");
+    if (!f) return -1;
+    int len = fread(buf, 1, 63, f);
+    fclose(f);
+    if (len <= 0) return -1;
+    buf[len] = 0;
+    return parse_ip(buf, ip);
 }
 
 static void cmd_dhcp(void) {
     printf("Acquiring DHCP lease...\n");
-    if (sys_network_dhcp_acquire() == 0) {
+    if (write_control("dhcp") == 0) {
         net_ipv4_address_t ip;
-        sys_network_get_ip(&ip);
-        printf("DHCP Success. IP: ");
-        print_ip(&ip);
-        printf("\n");
+        if (read_ip_prop("/sys/class/net/eth0/ip", &ip) == 0) {
+            printf("DHCP Success. IP: ");
+            print_ip(&ip);
+            printf("\n");
+        } else {
+            printf("DHCP lease acquired, but failed to read IP.\n");
+        }
     } else {
         printf("DHCP Failed.\n");
     }
 }
 
 static void cmd_dnsset(const char* ip_str) {
-    net_ipv4_address_t ip;
-    if (parse_ip(ip_str, &ip) != 0) {
-        printf("Invalid IP: %s\n", ip_str);
-        return;
-    }
-    if (sys_set_dns_server(&ip) == 0) {
+    char cmd[128];
+    strcpy(cmd, "set_dns ");
+    strcat(cmd, ip_str);
+    if (write_control(cmd) == 0) {
         printf("DNS server set to %s\n", ip_str);
     } else {
         printf("Failed to set DNS server.\n");
@@ -167,7 +192,7 @@ static void cmd_curl(const char* url) {
             printf("\n[Error: Connection error]\n");
             break;
         }
-        if (len == 0) break; // End of stream or timeout
+        if (len == 0) break;
         buf[len] = 0;
         printf("%s", buf);
         total += len;
@@ -203,27 +228,60 @@ static void cmd_ping(const char* host) {
 }
 
 static void cmd_netinfo(void) {
-    if (!sys_network_is_initialized()) {
+    char status_buf[256];
+    FILE* f = fopen("/sys/class/net/eth0/status", "r");
+    if (!f) {
         printf("Network not initialized.\n");
         return;
     }
-    net_mac_address_t mac;
-    net_ipv4_address_t ip, gw, dns;
-    char nic_name[64];
+    int s_len = fread(status_buf, 1, 255, f);
+    fclose(f);
+    if (s_len <= 0) {
+        printf("Network not initialized.\n");
+        return;
+    }
+    status_buf[s_len] = 0;
     
-    if (sys_network_get_nic_name(nic_name) == 0) {
+    if (strstr(status_buf, "initialized: 1") == NULL) {
+        printf("Network not initialized.\n");
+        return;
+    }
+
+    char nic_name[64];
+    nic_name[0] = 0;
+    f = fopen("/sys/class/net/eth0/nic", "r");
+    if (f) {
+        int len = fread(nic_name, 1, 63, f);
+        fclose(f);
+        if (len > 0) {
+            nic_name[len] = 0;
+            if (nic_name[len-1] == '\n') nic_name[len-1] = 0;
+        }
+    }
+    if (nic_name[0]) {
         printf("NIC: %s\n", nic_name);
     } else {
         printf("NIC: Unknown\n");
     }
 
-    sys_network_get_mac(&mac);
-    printf("MAC: %X:%X:%X:%X:%X:%X\n", mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3], mac.bytes[4], mac.bytes[5]);
+    char mac_buf[64];
+    mac_buf[0] = 0;
+    f = fopen("/sys/class/net/eth0/address", "r");
+    if (f) {
+        int len = fread(mac_buf, 1, 63, f);
+        fclose(f);
+        if (len > 0) {
+            mac_buf[len] = 0;
+            if (mac_buf[len-1] == '\n') mac_buf[len-1] = 0;
+        }
+    }
+    printf("MAC: %s\n", mac_buf);
     
-    if (sys_network_has_ip()) {
-        sys_network_get_ip(&ip);
-        sys_network_get_gateway(&gw);
-        sys_network_get_dns(&dns);
+    if (strstr(status_buf, "has_ip: 1") != NULL) {
+        net_ipv4_address_t ip, gw, dns;
+        read_ip_prop("/sys/class/net/eth0/ip", &ip);
+        read_ip_prop("/sys/class/net/eth0/gateway", &gw);
+        read_ip_prop("/sys/class/net/eth0/dns", &dns);
         printf("IP: "); print_ip(&ip); printf("\n");
         printf("GW: "); print_ip(&gw); printf("\n");
         printf("DNS: "); print_ip(&dns); printf("\n");
@@ -231,7 +289,17 @@ static void cmd_netinfo(void) {
         printf("IP: Not assigned (DHCP in progress or failed)\n");
     }
     
-    printf("Stats: Link RX=%d, TX=%d, UDP RX=%d\n", sys_network_get_stat(0), sys_network_get_stat(2), sys_network_get_stat(1));
+    char stats_buf[256];
+    stats_buf[0] = 0;
+    f = fopen("/sys/class/net/eth0/stats", "r");
+    if (f) {
+        int len = fread(stats_buf, 1, 255, f);
+        fclose(f);
+        if (len > 0) {
+            stats_buf[len] = 0;
+        }
+    }
+    printf("%s", stats_buf);
 }
 
 int main(int argc, char** argv) {
@@ -242,14 +310,28 @@ int main(int argc, char** argv) {
     }
     
     if (strcmp(argv[1], "init") == 0) {
-        if (sys_network_init() == 0) printf("Network [OK]\n");
+        if (write_control("init") == 0) printf("Network [OK]\n");
         else printf("Network [FAIL]\n");
         return 0;
     }
 
-    if (!sys_network_is_initialized()) {
+    char status_buf[256];
+    FILE* f = fopen("/sys/class/net/eth0/status", "r");
+    bool is_init = false;
+    if (f) {
+        int len = fread(status_buf, 1, 255, f);
+        fclose(f);
+        if (len > 0) {
+            status_buf[len] = 0;
+            if (strstr(status_buf, "initialized: 1") != NULL) {
+                is_init = true;
+            }
+        }
+    }
+    
+    if (!is_init) {
         printf("Initializing network...\n");
-        sys_network_init();
+        write_control("init");
     }
 
     if (strcmp(argv[1], "dhcp") == 0) cmd_dhcp();

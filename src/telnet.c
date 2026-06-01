@@ -693,13 +693,54 @@ int main(int argc, char **argv) {
         use_ssl = 1;
     }
 
-    if (!sys_network_is_initialized()) {
-        printf("Initializing network...\n");
-        sys_network_init();
+    char status_buf[256];
+    FILE* f = fopen("/sys/class/net/eth0/status", "r");
+    bool is_init = false;
+    bool has_ip = false;
+    if (f) {
+        int len = fread(status_buf, 1, 255, f);
+        fclose(f);
+        if (len > 0) {
+            status_buf[len] = 0;
+            if (strstr(status_buf, "initialized: 1") != NULL) is_init = true;
+            if (strstr(status_buf, "has_ip: 1") != NULL) has_ip = true;
+        }
     }
-    if (!sys_network_has_ip()) {
+    
+    if (!is_init) {
+        printf("Initializing network...\n");
+        FILE* ctrl = fopen("/sys/class/net/eth0/control", "w");
+        if (ctrl) {
+            fwrite("init", 1, 4, ctrl);
+            fclose(ctrl);
+        }
+    }
+
+    if (!has_ip) {
         printf("Acquiring DHCP...\n");
-        if (sys_network_dhcp_acquire() != 0) {
+        FILE* ctrl = fopen("/sys/class/net/eth0/control", "w");
+        if (ctrl) {
+            fwrite("dhcp", 1, 4, ctrl);
+            fclose(ctrl);
+        }
+        // Wait up to 5 seconds for IP to be assigned
+        int attempts = 50;
+        while (attempts-- > 0) {
+            for (volatile int d=0; d<2000000; d++); // delay
+            f = fopen("/sys/class/net/eth0/status", "r");
+            if (f) {
+                int len = fread(status_buf, 1, 255, f);
+                fclose(f);
+                if (len > 0) {
+                    status_buf[len] = 0;
+                    if (strstr(status_buf, "has_ip: 1") != NULL) {
+                        has_ip = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!has_ip) {
             printf("DHCP failed.\n");
             return 1;
         }
