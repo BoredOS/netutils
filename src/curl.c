@@ -211,11 +211,11 @@ static int clone_pkey(br_x509_pkey *dst, const br_x509_pkey *src) {
     return 0;
 }
 
-static void load_dynamic_certs(void) {
+static void load_dynamic_certs(int silent) {
     FAT32_FileInfo entries[128];
     int count = sys_list("/etc/cert", entries, 128);
     if (count <= 0) {
-        printf("No certificates found in /etc/cert or folder missing.\n");
+        if (!silent) printf("No certificates found in /etc/cert or folder missing.\n");
         return;
     }
 
@@ -238,7 +238,7 @@ static void load_dynamic_certs(void) {
 
         int fd = sys_open(path, "r");
         if (fd < 0) {
-            printf("Warning: Cannot open certificate file: %s\n", path);
+            if (!silent) printf("Warning: Cannot open certificate file: %s\n", path);
             continue;
         }
 
@@ -332,9 +332,9 @@ static void load_dynamic_certs(void) {
     }
 
     if (dynamic_TAs_num > 0) {
-        printf("Successfully loaded %d dynamic CA certificates from /etc/cert\n", (int)dynamic_TAs_num);
+        if (!silent) printf("Successfully loaded %d dynamic CA certificates from /etc/cert\n", (int)dynamic_TAs_num);
     } else {
-        printf("No valid certificates loaded from /etc/cert.\n");
+        if (!silent) printf("No valid certificates loaded from /etc/cert.\n");
         free(dynamic_TAs);
         dynamic_TAs = NULL;
     }
@@ -358,20 +358,52 @@ static void free_dynamic_certs(void) {
 
 static unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];
 
-int main(int argc, char** argv) {
-    int insecure = 0;
-    const char* url = NULL;
-    
-    for (int idx = 1; idx < argc; idx++) {
-        if (strcmp(argv[idx], "-k") == 0 || strcmp(argv[idx], "--insecure") == 0) {
-            insecure = 1;
-        } else {
-            url = argv[idx];
+static int custom_strncasecmp(const char *s1, const char *s2, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        char c1 = s1[i];
+        char c2 = s2[i];
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        if (c1 != c2) return (unsigned char)c1 - (unsigned char)c2;
+        if (c1 == '\0') return 0;
+    }
+    return 0;
+}
+
+static int parse_status_code(const char *headers) {
+    if (strncmp(headers, "HTTP/", 5) == 0) {
+        const char *p = strchr(headers, ' ');
+        if (p) {
+            while (*p == ' ') p++;
+            return atoi(p);
         }
     }
-    
-    if (url == NULL) {
-        printf("Usage: curl [-k|--insecure] http(s)://a.b.c.d[:port]/path\n");
+    return 0;
+}
+
+static int get_location_header(const char *headers, char *dest, size_t dest_len) {
+    const char *p = headers;
+    while (*p) {
+        if (custom_strncasecmp(p, "Location:", 9) == 0) {
+            p += 9;
+            while (*p == ' ' || *p == '\t') p++;
+            size_t i = 0;
+            while (*p && *p != '\r' && *p != '\n' && i < dest_len - 1) {
+                dest[i++] = *p++;
+            }
+            dest[i] = '\0';
+            return 1;
+        }
+        p = strchr(p, '\n');
+        if (!p) break;
+        p++;
+    }
+    return 0;
+}
+
+static int perform_download(const char* url, int insecure, int fail_silent, int silent, int show_error, int follow_location, const char* output_file, int redirect_depth) {
+    if (redirect_depth > 10) {
+        if (!silent) fprintf(stderr, "Error: Too many redirects\n");
         return 1;
     }
 
@@ -410,24 +442,26 @@ int main(int argc, char** argv) {
     net_ipv4_address_t ip;
     if (parse_ip(hostname, &ip) != 0) {
         if (sys_dns_lookup(hostname, &ip) != 0) {
-            printf("Failed to resolve %s\n", hostname);
+            if (!silent) printf("Failed to resolve %s\n", hostname);
             return 1;
         }
     }
     
-    printf("Connecting to %s (", hostname);
-    printf("%d.%d.%d.%d", ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3]);
-    printf("):%d...\n", port);
+    if (!silent) {
+        printf("Connecting to %s (", hostname);
+        printf("%d.%d.%d.%d", ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3]);
+        printf("):%d...\n", port);
+    }
 
     if (sys_tcp_connect(&ip, port) != 0) {
-        printf("Failed to connect to %s:%d\n", hostname, port);
+        if (!silent) printf("Failed to connect to %s:%d\n", hostname, port);
         return 1;
     }
     
     const char* path = host_start + i;
     if (*path == 0) path = "/";
     
-    char request[1024];
+    char request[2048];
     int req_len = 0;
     
     char* r = request;
@@ -440,25 +474,35 @@ int main(int argc, char** argv) {
     s = "\r\nUser-Agent: BoredOS/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"; while(*s) *r++ = *s++;
     req_len = r - request;
 
+    FILE *out_f = NULL;
+    if (!output_file) {
+        out_f = stdout;
+    }
+
+    char header_buf[8192];
+    int header_buf_len = 0;
+    int header_end_idx = -1;
+    int status_failed = 0;
+
     if (is_https) {
         br_ssl_client_context sc;
         dummy_x509_context dummy_xc;
         br_sslio_context ioc;
 
         if (insecure) {
-            printf("Initializing SSL/TLS session (insecure verification mode)...\n");
+            if (!silent) printf("Initializing SSL/TLS session (insecure verification mode)...\n");
             br_ssl_client_init_full(&sc, &dummy_xc.minimal, NULL, 0);
             br_x509_minimal_set_time_callback(&dummy_xc.minimal, NULL, dummy_time_check);
 
             dummy_xc.vtable = &dummy_x509_vtable;
             br_ssl_engine_set_x509(&sc.eng, &dummy_xc.vtable);
         } else {
-            printf("Initializing SSL/TLS session (cryptographically secure mode)...\n"); 
-            load_dynamic_certs();
+            if (!silent) printf("Initializing SSL/TLS session (cryptographically secure mode)...\n"); 
+            load_dynamic_certs(silent);
             if (dynamic_TAs && dynamic_TAs_num > 0) {
                 br_ssl_client_init_full(&sc, &dummy_xc.minimal, dynamic_TAs, dynamic_TAs_num);
             } else {
-                printf("No dynamic CA certificates found; TLS verification may fail. Add PEMs to /etc/cert or use -k/--insecure.\n");
+                if (!silent) printf("No dynamic CA certificates found; TLS verification may fail. Add PEMs to /etc/cert or use -k/--insecure.\n");
                 br_ssl_client_init_full(&sc, &dummy_xc.minimal, NULL, 0);
             }
             int dt[6];
@@ -470,19 +514,19 @@ int main(int argc, char** argv) {
                     seconds = dt[3] * 3600 + dt[4] * 60 + dt[5];
                     br_x509_minimal_set_time(&dummy_xc.minimal, days, seconds);
                 } else {
-                    printf("[Warning: RTC clock uninitialized, secure date check may fail! Set system date or use -k/--insecure]\n");
+                    if (!silent) printf("[Warning: RTC clock uninitialized, secure date check may fail! Set system date or use -k/--insecure]\n");
                 }
             }
         }
         uint64_t seed[4];
         if (has_rdrand()) {
-            printf("Seeding secure DRBG with CPU hardware entropy (RDRAND)...\n");
+            if (!silent) printf("Seeding secure DRBG with CPU hardware entropy (RDRAND)...\n");
             seed[0] = get_rdrand();
             seed[1] = get_rdrand();
             seed[2] = get_rdrand();
             seed[3] = get_rdrand();
         } else {
-            printf("Warning: CPU RDRAND unsupported! Seeding secure DRBG with system ticks and RTC fallback...\n");
+            if (!silent) printf("Warning: CPU RDRAND unsupported! Seeding secure DRBG with system ticks and RTC fallback...\n");
             seed[0] = sys_system(SYSTEM_CMD_GET_TICKS, 0, 0, 0, 0);
             seed[1] = (uintptr_t)&sc;
             seed[2] = get_rdtsc();
@@ -491,20 +535,22 @@ int main(int argc, char** argv) {
         br_ssl_engine_inject_entropy(&sc.eng, seed, sizeof(seed));
         br_ssl_engine_set_buffer(&sc.eng, iobuf, sizeof(iobuf), 1);
         if (br_ssl_client_reset(&sc, hostname, 0) == 0) {
-            printf("\n[Error: SSL client reset failed (RNG unseeded or invalid)]\n");
+            if (!silent) printf("\n[Error: SSL client reset failed (RNG unseeded or invalid)]\n");
             sys_tcp_close();
             free_dynamic_certs();
             return 1;
         }
         br_sslio_init(&ioc, &sc.eng, sock_read, NULL, sock_write, NULL);
 
-        printf("Performing SSL handshake...\n");
+        if (!silent) printf("Performing SSL handshake...\n");
 
         if (br_sslio_write_all(&ioc, request, req_len) != 0) {
             int err = br_ssl_engine_last_error(&sc.eng);
-            printf("\n[Error: SSL handshake or request sending failed, error code: %d]\n", err);
-            if (err == BR_ERR_X509_NOT_TRUSTED && !insecure) {
-                printf("[Tip: Certificate was not trusted by root CA store. You can bypass using -k or --insecure option]\n");
+            if (!silent) {
+                printf("\n[Error: SSL handshake or request sending failed, error code: %d]\n", err);
+                if (err == BR_ERR_X509_NOT_TRUSTED && !insecure) {
+                    printf("[Tip: Certificate was not trusted by root CA store. You can bypass using -k or --insecure option]\n");
+                }
             }
             sys_tcp_close();
             free_dynamic_certs();
@@ -513,13 +559,13 @@ int main(int argc, char** argv) {
 
         if (br_sslio_flush(&ioc) != 0) {
             int err = br_ssl_engine_last_error(&sc.eng);
-            printf("\n[Error: SSL stream flush failed, error code: %d]\n", err);
+            if (!silent) printf("\n[Error: SSL stream flush failed, error code: %d]\n", err);
             sys_tcp_close();
             free_dynamic_certs();
             return 1;
         }
 
-        printf("Receiving response...\n");
+        if (!silent) printf("Receiving response...\n");
 
         char buf[4096];
         int total = 0;
@@ -529,12 +575,77 @@ int main(int argc, char** argv) {
                 break;
             }
             if (len == 0) break;
-            buf[len] = 0;
-            printf("%s", buf);
             total += len;
-            if (total > 1000000) {
-                printf("\n[Error: Data limit exceeded]\n");
+            if (total > 10000000) {
+                if (!silent) printf("\n[Error: Data limit exceeded]\n");
                 break;
+            }
+
+            if (header_end_idx == -1) {
+                int to_copy = len;
+                if (header_buf_len + to_copy > (int)sizeof(header_buf) - 1) {
+                    to_copy = (int)sizeof(header_buf) - 1 - header_buf_len;
+                }
+                if (to_copy > 0) {
+                    memcpy(header_buf + header_buf_len, buf, to_copy);
+                    header_buf_len += to_copy;
+                    header_buf[header_buf_len] = '\0';
+                }
+                
+                char *end_ptr = strstr(header_buf, "\r\n\r\n");
+                int delim_len = 4;
+                if (!end_ptr) {
+                    end_ptr = strstr(header_buf, "\n\n");
+                    delim_len = 2;
+                }
+                
+                if (end_ptr) {
+                    header_end_idx = end_ptr - header_buf;
+                    int status = parse_status_code(header_buf);
+                    
+                    if (status >= 400 && fail_silent) {
+                        status_failed = 1;
+                        break;
+                    }
+                    
+                    if (status >= 300 && status < 400 && follow_location) {
+                        char loc[1024];
+                        if (get_location_header(header_buf, loc, sizeof(loc))) {
+                            char next_url[2048];
+                            if (loc[0] == '/') {
+                                snprintf(next_url, sizeof(next_url), "%s://%s%s", is_https ? "https" : "http", hostname, loc);
+                            } else {
+                                strncpy(next_url, loc, sizeof(next_url) - 1);
+                                next_url[sizeof(next_url) - 1] = '\0';
+                            }
+                            
+                            br_sslio_close(&ioc);
+                            sys_tcp_close();
+                            free_dynamic_certs();
+                            
+                            return perform_download(next_url, insecure, fail_silent, silent, show_error, follow_location, output_file, redirect_depth + 1);
+                        }
+                    }
+                    
+                    if (output_file && !out_f) {
+                        out_f = fopen(output_file, "wb");
+                        if (!out_f) {
+                            if (!silent) fprintf(stderr, "Failed to open output file %s\n", output_file);
+                            br_sslio_close(&ioc);
+                            sys_tcp_close();
+                            free_dynamic_certs();
+                            return 1;
+                        }
+                    }
+
+                    int header_portion = (header_end_idx + delim_len) - (header_buf_len - len);
+                    if (header_portion < len) {
+                        int body_len = len - header_portion;
+                        fwrite(buf + header_portion, 1, body_len, out_f);
+                    }
+                }
+            } else {
+                fwrite(buf, 1, len, out_f);
             }
         }
 
@@ -548,21 +659,199 @@ int main(int argc, char** argv) {
         while (1) {
             int len = sys_tcp_recv(buf, 4095);
             if (len < 0) {
-                printf("\n[Error: Connection closed or error]\n");
+                if (!silent && header_end_idx == -1) printf("\n[Error: Connection closed or error]\n");
                 break;
             }
             if (len == 0) break;
-            buf[len] = 0;
-            printf("%s", buf);
             total += len;
-            if (total > 1000000) {
-                printf("\n[Error: Data limit exceeded]\n");
+            if (total > 10000000) {
+                if (!silent) printf("\n[Error: Data limit exceeded]\n");
                 break;
+            }
+
+            if (header_end_idx == -1) {
+                int to_copy = len;
+                if (header_buf_len + to_copy > (int)sizeof(header_buf) - 1) {
+                    to_copy = (int)sizeof(header_buf) - 1 - header_buf_len;
+                }
+                if (to_copy > 0) {
+                    memcpy(header_buf + header_buf_len, buf, to_copy);
+                    header_buf_len += to_copy;
+                    header_buf[header_buf_len] = '\0';
+                }
+                
+                char *end_ptr = strstr(header_buf, "\r\n\r\n");
+                int delim_len = 4;
+                if (!end_ptr) {
+                    end_ptr = strstr(header_buf, "\n\n");
+                    delim_len = 2;
+                }
+                
+                if (end_ptr) {
+                    header_end_idx = end_ptr - header_buf;
+                    int status = parse_status_code(header_buf);
+                    
+                    if (status >= 400 && fail_silent) {
+                        status_failed = 1;
+                        break;
+                    }
+                    
+                    if (status >= 300 && status < 400 && follow_location) {
+                        char loc[1024];
+                        if (get_location_header(header_buf, loc, sizeof(loc))) {
+                            char next_url[2048];
+                            if (loc[0] == '/') {
+                                snprintf(next_url, sizeof(next_url), "%s://%s%s", is_https ? "https" : "http", hostname, loc);
+                            } else {
+                                strncpy(next_url, loc, sizeof(next_url) - 1);
+                                next_url[sizeof(next_url) - 1] = '\0';
+                            }
+                            
+                            sys_tcp_close();
+                            free_dynamic_certs();
+                            
+                            return perform_download(next_url, insecure, fail_silent, silent, show_error, follow_location, output_file, redirect_depth + 1);
+                        }
+                    }
+                    
+                    if (output_file && !out_f) {
+                        out_f = fopen(output_file, "wb");
+                        if (!out_f) {
+                            if (!silent) fprintf(stderr, "Failed to open output file %s\n", output_file);
+                            sys_tcp_close();
+                            free_dynamic_certs();
+                            return 1;
+                        }
+                    }
+
+                    int header_portion = (header_end_idx + delim_len) - (header_buf_len - len);
+                    if (header_portion < len) {
+                        int body_len = len - header_portion;
+                        fwrite(buf + header_portion, 1, body_len, out_f);
+                    }
+                }
+            } else {
+                fwrite(buf, 1, len, out_f);
             }
         }
     }
     
     sys_tcp_close();
     free_dynamic_certs();
+
+    if (output_file && !out_f && !status_failed) {
+        out_f = fopen(output_file, "wb");
+        if (out_f) fclose(out_f);
+    } else if (out_f && out_f != stdout) {
+        fclose(out_f);
+    }
+
+    if (status_failed) {
+        if (output_file) {
+            remove(output_file);
+        }
+        return 22;
+    }
+
     return 0;
+}
+
+static const char* strip_quotes(const char* str, char* buf, size_t buf_len) {
+    if (!str) return NULL;
+    size_t len = strlen(str);
+    if (len >= 2 && ((str[0] == '\'' && str[len - 1] == '\'') || (str[0] == '"' && str[len - 1] == '"'))) {
+        size_t to_copy = len - 2;
+        if (to_copy >= buf_len) to_copy = buf_len - 1;
+        memcpy(buf, str + 1, to_copy);
+        buf[to_copy] = '\0';
+        return buf;
+    }
+    return str;
+}
+
+int main(int argc, char** argv) {
+    int insecure = 0;
+    int fail_silent = 0;
+    int silent = 0;
+    int show_error = 0;
+    int follow_location = 0;
+    const char* output_file = NULL;
+    const char* url = NULL;
+    
+    for (int idx = 1; idx < argc; idx++) {
+        if (argv[idx][0] == '-') {
+            if (strcmp(argv[idx], "--insecure") == 0) {
+                insecure = 1;
+            } else if (strcmp(argv[idx], "--fail") == 0) {
+                fail_silent = 1;
+            } else if (strcmp(argv[idx], "--silent") == 0) {
+                silent = 1;
+            } else if (strcmp(argv[idx], "--show-error") == 0) {
+                show_error = 1;
+            } else if (strcmp(argv[idx], "--location") == 0) {
+                follow_location = 1;
+            } else if (strcmp(argv[idx], "--output") == 0) {
+                if (idx + 1 < argc) {
+                    output_file = argv[++idx];
+                } else {
+                    fprintf(stderr, "Option --output requires an argument\n");
+                    return 1;
+                }
+            } else {
+                for (int j = 1; argv[idx][j] != '\0'; j++) {
+                    char opt = argv[idx][j];
+                    if (opt == 'k') {
+                        insecure = 1;
+                    } else if (opt == 'f') {
+                        fail_silent = 1;
+                    } else if (opt == 's') {
+                        silent = 1;
+                    } else if (opt == 'S') {
+                        show_error = 1;
+                    } else if (opt == 'L') {
+                        follow_location = 1;
+                    } else if (opt == 'o') {
+                        if (argv[idx][j + 1] != '\0') {
+                            output_file = &argv[idx][j + 1];
+                            break;
+                        } else if (idx + 1 < argc) {
+                            output_file = argv[++idx];
+                            break;
+                        } else {
+                            fprintf(stderr, "Option -o requires an argument\n");
+                            return 1;
+                        }
+                    } else {
+                        fprintf(stderr, "Unknown option -%c\n", opt);
+                        return 1;
+                    }
+                }
+            }
+        } else {
+            if (strncmp(argv[idx], ">", 1) != 0 && strncmp(argv[idx], "2>", 2) != 0) {
+                if (url == NULL) {
+                    url = argv[idx];
+                }
+            }
+        }
+    }
+    
+    if (url == NULL) {
+        printf("Usage: curl [options] <url>\n");
+        printf("Options:\n");
+        printf("  -k, --insecure      Allow insecure SSL/TLS connections\n");
+        printf("  -f, --fail          Fail silently on HTTP errors (status >= 400)\n");
+        printf("  -s, --silent        Silent mode\n");
+        printf("  -S, --show-error    Show error message even when silent\n");
+        printf("  -L, --location      Follow Location/redirect headers\n");
+        printf("  -o, --output <file> Write output to <file> instead of stdout\n");
+        return 1;
+    }
+
+    char clean_url[1024];
+    char clean_out[1024];
+    const char* final_url = strip_quotes(url, clean_url, sizeof(clean_url));
+    const char* final_output = strip_quotes(output_file, clean_out, sizeof(clean_out));
+
+    return perform_download(final_url, insecure, fail_silent, silent, show_error, follow_location, final_output, 0);
 }
