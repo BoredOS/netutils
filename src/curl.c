@@ -212,16 +212,21 @@ static int clone_pkey(br_x509_pkey *dst, const br_x509_pkey *src) {
 }
 
 static void load_dynamic_certs(int silent) {
-    FAT32_FileInfo entries[128];
+    FAT32_FileInfo *entries = malloc(sizeof(FAT32_FileInfo) * 128);
+    if (!entries) return;
     int count = sys_list("/etc/cert", entries, 128);
     if (count <= 0) {
         if (!silent) printf("No certificates found in /etc/cert or folder missing.\n");
+        free(entries);
         return;
     }
 
     size_t ta_capacity = 8;
     dynamic_TAs = malloc(ta_capacity * sizeof(br_x509_trust_anchor));
-    if (!dynamic_TAs) return;
+    if (!dynamic_TAs) {
+        free(entries);
+        return;
+    }
 
     for (int idx = 0; idx < count; idx++) {
         if (entries[idx].is_directory) continue;
@@ -330,6 +335,8 @@ static void load_dynamic_certs(int silent) {
         free(der.data);
         free(file_buf);
     }
+
+    free(entries);
 
     if (dynamic_TAs_num > 0) {
         if (!silent) printf("Successfully loaded %d dynamic CA certificates from /etc/cert\n", (int)dynamic_TAs_num);
