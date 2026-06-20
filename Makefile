@@ -96,5 +96,20 @@ install: all
 	if [ -d certs ]; then cp certs/*.pem $(DESTDIR)/etc/cert/; fi
 	cp index.html $(DESTDIR)/etc/index.html
 
+.PHONY: bup
+bup: all
+	rm -rf build/package
+	mkdir -p build/package/bin
+	mkdir -p build/package/config/cert
+	cp $(APPS) build/package/bin/
+	if [ -d certs ]; then cp certs/*.pem build/package/config/cert/; fi
+	cp index.html build/package/config/
+	cp MANIFEST.toml build/package/
+	mkdir -p build
+	tar -cf build/netutils.tar -C build/package MANIFEST.toml bin config
+	lz4 -f build/netutils.tar build/netutils.bup
+	rm -f build/netutils.tar
+	rm -rf build/package
+
 clean:
 	rm -rf obj build $(APPS)

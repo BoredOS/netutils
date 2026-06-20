@@ -1,0 +1,9 @@
+name = "netutils"
+version = "1.0.0"
+description = "Network utilities (ping, telnet, curl, etc.) for BoredOS"
+author = "Christiaan"
+license = "GPLv3"
+
+[install]
+bin = "/bin"
+config = "/etc"
