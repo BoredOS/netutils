@@ -92,21 +92,23 @@ obj/%.o: src/%.c
 install: all
 	mkdir -p $(DESTDIR)/bin
 	cp $(APPS) $(DESTDIR)/bin/
-	mkdir -p $(DESTDIR)/etc/cert
-	if [ -d certs ]; then cp certs/*.pem $(DESTDIR)/etc/cert/; fi
-	cp index.html $(DESTDIR)/etc/index.html
+	mkdir -p $(DESTDIR)/Library/Certificates
+	if [ -d certs ]; then cp certs/*.pem $(DESTDIR)/Library/Certificates/; fi
+	mkdir -p $(DESTDIR)/Library/AppData/org.boredos.httpd
+	cp index.html $(DESTDIR)/Library/AppData/org.boredos.httpd/index.html
 
 .PHONY: bup
 bup: all
 	rm -rf build/package
 	mkdir -p build/package/bin
-	mkdir -p build/package/config/cert
+	mkdir -p build/package/config
+	mkdir -p build/package/assets
 	cp $(APPS) build/package/bin/
-	if [ -d certs ]; then cp certs/*.pem build/package/config/cert/; fi
-	cp index.html build/package/config/
+	if [ -d certs ]; then cp certs/*.pem build/package/config/; fi
+	cp index.html build/package/assets/
 	cp MANIFEST.toml build/package/
 	mkdir -p build
-	tar -cf build/netutils.tar -C build/package MANIFEST.toml bin config
+	tar -cf build/netutils.tar -C build/package MANIFEST.toml bin config assets
 	lz4 -f build/netutils.tar build/netutils.bup
 	rm -f build/netutils.tar
 	rm -rf build/package

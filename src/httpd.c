@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
     if (single_file) {
         printf("[httpd] Single-file mode: Serving '%s' for all requests\n", single_file);
     } else {
-        printf("[httpd] Dynamic path resolution mode (defaulting to '/etc/index.html')\n");
+        printf("[httpd] Dynamic path resolution mode (defaulting to '/Library/AppData/org.boredos.httpd/index.html')\n");
     }
 
     if (sys_tcp_listen((uint16_t)port) < 0) {
@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
         if (!file_to_serve) {
             file_to_serve = path;
             if (strcmp(file_to_serve, "/") == 0) {
-                file_to_serve = "/etc/index.html";
+                file_to_serve = "/Library/AppData/org.boredos.httpd/index.html";
             }
         }
 

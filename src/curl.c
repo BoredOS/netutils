@@ -214,9 +214,9 @@ static int clone_pkey(br_x509_pkey *dst, const br_x509_pkey *src) {
 static void load_dynamic_certs(int silent) {
     FAT32_FileInfo *entries = malloc(sizeof(FAT32_FileInfo) * 128);
     if (!entries) return;
-    int count = sys_list("/etc/cert", entries, 128);
+    int count = sys_list("/Library/Certificates", entries, 128);
     if (count <= 0) {
-        if (!silent) printf("No certificates found in /etc/cert or folder missing.\n");
+        if (!silent) printf("No certificates found in /Library/Certificates or folder missing.\n");
         free(entries);
         return;
     }
@@ -238,7 +238,7 @@ static void load_dynamic_certs(int silent) {
         }
 
         char path[512];
-        strcpy(path, "/etc/cert/");
+        strcpy(path, "/Library/Certificates/");
         strcat(path, name);
 
         int fd = sys_open(path, "r");
@@ -339,9 +339,9 @@ static void load_dynamic_certs(int silent) {
     free(entries);
 
     if (dynamic_TAs_num > 0) {
-        if (!silent) printf("Successfully loaded %d dynamic CA certificates from /etc/cert\n", (int)dynamic_TAs_num);
+        if (!silent) printf("Successfully loaded %d dynamic CA certificates from /Library/Certificates\n", (int)dynamic_TAs_num);
     } else {
-        if (!silent) printf("No valid certificates loaded from /etc/cert.\n");
+        if (!silent) printf("No valid certificates loaded from /Library/Certificates.\n");
         free(dynamic_TAs);
         dynamic_TAs = NULL;
     }
@@ -509,7 +509,7 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
             if (dynamic_TAs && dynamic_TAs_num > 0) {
                 br_ssl_client_init_full(&sc, &dummy_xc.minimal, dynamic_TAs, dynamic_TAs_num);
             } else {
-                if (!silent) printf("No dynamic CA certificates found; TLS verification may fail. Add PEMs to /etc/cert or use -k/--insecure.\n");
+                if (!silent) printf("No dynamic CA certificates found; TLS verification may fail. Add PEMs to /Library/Certificates or use -k/--insecure.\n");
                 br_ssl_client_init_full(&sc, &dummy_xc.minimal, NULL, 0);
             }
             int dt[6];

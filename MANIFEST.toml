@@ -6,4 +6,5 @@ license = "GPLv3"
 
 [install]
 bin = "/bin"
-config = "/etc"
+config = "/Library/Certificates"
+assets = "/Library/AppData/org.boredos.httpd"
