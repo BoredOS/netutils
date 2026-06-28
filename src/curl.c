@@ -8,6 +8,9 @@
 #include <unistd.h>
 #include <string.h>
 #include <bearssl.h>
+#include <sys/socket.h>
+
+static int conn_fd = -1;
 
 static int parse_ip(const char* str, net_ipv4_address_t* ip) {
     int val = 0;
@@ -33,7 +36,7 @@ static int parse_ip(const char* str, net_ipv4_address_t* ip) {
 
 static int sock_read(void *ctx, unsigned char *buf, size_t len) {
     (void)ctx;
-    int r = sys_tcp_recv(buf, len);
+    int r = recv(conn_fd, buf, len, 0);
     if (r < 0) {
         return -1;
     }
@@ -42,7 +45,7 @@ static int sock_read(void *ctx, unsigned char *buf, size_t len) {
 
 static int sock_write(void *ctx, const unsigned char *buf, size_t len) {
     (void)ctx;
-    int r = sys_tcp_send(buf, len);
+    int r = send(conn_fd, buf, len, 0);
     if (r < 0) {
         return -1;
     }
@@ -448,7 +451,7 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
     
     net_ipv4_address_t ip;
     if (parse_ip(hostname, &ip) != 0) {
-        if (sys_dns_lookup(hostname, &ip) != 0) {
+        if (dns_lookup(hostname, &ip) != 0) {
             if (!silent) printf("Failed to resolve %s\n", hostname);
             return 1;
         }
@@ -460,8 +463,25 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
         printf("):%d...\n", port);
     }
 
-    if (sys_tcp_connect(&ip, port) != 0) {
+    if (conn_fd >= 0) {
+        close(conn_fd);
+        conn_fd = -1;
+    }
+    conn_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (conn_fd < 0) {
+        if (!silent) printf("Failed to create socket\n");
+        return 1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    memcpy(&addr.sin_addr, &ip, 4);
+
+    if (connect(conn_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         if (!silent) printf("Failed to connect to %s:%d\n", hostname, port);
+        close(conn_fd);
+        conn_fd = -1;
         return 1;
     }
     
@@ -515,7 +535,7 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
             int dt[6];
             uint32_t days = 719528; // Default to Unix Epoch day
             uint32_t seconds = 0;
-            if (sys_system(SYSTEM_CMD_RTC_GET, (uint64_t)dt, 0, 0, 0) == 0) {
+            if (rtc_get(dt) == 0) {
                 if (dt[0] >= 1970 && dt[1] >= 1 && dt[1] <= 12 && dt[2] >= 1 && dt[2] <= 31) {
                     days = rtc_to_days_since_1970(dt[0], dt[1], dt[2]) + 719528;
                     seconds = dt[3] * 3600 + dt[4] * 60 + dt[5];
@@ -534,16 +554,16 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
             seed[3] = get_rdrand();
         } else {
             if (!silent) printf("Warning: CPU RDRAND unsupported! Seeding secure DRBG with system ticks and RTC fallback...\n");
-            seed[0] = sys_system(SYSTEM_CMD_GET_TICKS, 0, 0, 0, 0);
+            seed[0] = get_ticks();
             seed[1] = (uintptr_t)&sc;
             seed[2] = get_rdtsc();
-            seed[3] = sys_system(SYSTEM_CMD_RTC_GET, 0, 0, 0, 0);
+            seed[3] = rtc_get(NULL);
         }
         br_ssl_engine_inject_entropy(&sc.eng, seed, sizeof(seed));
         br_ssl_engine_set_buffer(&sc.eng, iobuf, sizeof(iobuf), 1);
         if (br_ssl_client_reset(&sc, hostname, 0) == 0) {
             if (!silent) printf("\n[Error: SSL client reset failed (RNG unseeded or invalid)]\n");
-            sys_tcp_close();
+            close(conn_fd); conn_fd = -1;;
             free_dynamic_certs();
             return 1;
         }
@@ -559,7 +579,7 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
                     printf("[Tip: Certificate was not trusted by root CA store. You can bypass using -k or --insecure option]\n");
                 }
             }
-            sys_tcp_close();
+            close(conn_fd); conn_fd = -1;;
             free_dynamic_certs();
             return 1;
         }
@@ -567,7 +587,7 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
         if (br_sslio_flush(&ioc) != 0) {
             int err = br_ssl_engine_last_error(&sc.eng);
             if (!silent) printf("\n[Error: SSL stream flush failed, error code: %d]\n", err);
-            sys_tcp_close();
+            close(conn_fd); conn_fd = -1;;
             free_dynamic_certs();
             return 1;
         }
@@ -627,7 +647,7 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
                             }
                             
                             br_sslio_close(&ioc);
-                            sys_tcp_close();
+                            close(conn_fd); conn_fd = -1;;
                             free_dynamic_certs();
                             
                             return perform_download(next_url, insecure, fail_silent, silent, show_error, follow_location, output_file, redirect_depth + 1);
@@ -639,7 +659,7 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
                         if (!out_f) {
                             if (!silent) fprintf(stderr, "Failed to open output file %s\n", output_file);
                             br_sslio_close(&ioc);
-                            sys_tcp_close();
+                            close(conn_fd); conn_fd = -1;;
                             free_dynamic_certs();
                             return 1;
                         }
@@ -659,12 +679,12 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
         br_sslio_close(&ioc);
     } else {
         // Plain unencrypted HTTP
-        sys_tcp_send(request, req_len);
-        
+        send(conn_fd, request, req_len, 0);
+
         char buf[4096];
         int total = 0;
         while (1) {
-            int len = sys_tcp_recv(buf, 4095);
+            int len = recv(conn_fd, buf, 4095, 0);
             if (len < 0) {
                 if (!silent && header_end_idx == -1) printf("\n[Error: Connection closed or error]\n");
                 break;
@@ -714,7 +734,7 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
                                 next_url[sizeof(next_url) - 1] = '\0';
                             }
                             
-                            sys_tcp_close();
+                            close(conn_fd); conn_fd = -1;;
                             free_dynamic_certs();
                             
                             return perform_download(next_url, insecure, fail_silent, silent, show_error, follow_location, output_file, redirect_depth + 1);
@@ -725,7 +745,7 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
                         out_f = fopen(output_file, "wb");
                         if (!out_f) {
                             if (!silent) fprintf(stderr, "Failed to open output file %s\n", output_file);
-                            sys_tcp_close();
+                            close(conn_fd); conn_fd = -1;;
                             free_dynamic_certs();
                             return 1;
                         }
@@ -743,7 +763,7 @@ static int perform_download(const char* url, int insecure, int fail_silent, int 
         }
     }
     
-    sys_tcp_close();
+    close(conn_fd); conn_fd = -1;;
     free_dynamic_certs();
 
     if (output_file && !out_f && !status_failed) {

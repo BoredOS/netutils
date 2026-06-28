@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <stdbool.h>
 
 static void print_ip(const net_ipv4_address_t* ip) {
@@ -39,7 +40,7 @@ static int parse_ip(const char* str, net_ipv4_address_t* ip) {
 
 static int resolve_host(const char* host, net_ipv4_address_t* ip) {
     if (parse_ip(host, ip) == 0) return 0;
-    return sys_dns_lookup(host, ip);
+    return dns_lookup(host, ip);
 }
 
 static int write_control(const char* cmd) {
@@ -91,7 +92,7 @@ static void cmd_dnsset(const char* ip_str) {
 static void cmd_dig(const char* name) {
     net_ipv4_address_t ip;
     printf("Resolving %s...\n", name);
-    if (sys_dns_lookup(name, &ip) == 0) {
+    if (dns_lookup(name, &ip) == 0) {
         printf("%s resolves to ", name);
         print_ip(&ip);
         printf("\n");
@@ -109,22 +110,34 @@ static void cmd_nc(const char* host, const char* port_str, const char* msg) {
     uint16_t port = (uint16_t)atoi(port_str);
     
     printf("Connecting to "); print_ip(&ip); printf(":%d...\n", port);
-    if (sys_tcp_connect(&ip, port) != 0) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        printf("Failed to create socket.\n");
+        return;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    memcpy(&addr.sin_addr, &ip, 4);
+    
+    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         printf("Connection failed.\n");
+        close(sockfd);
         return;
     }
     printf("Connected.\n");
     
     if (msg == NULL) msg = "Hello world! (From BoredOS)\n";
-    sys_tcp_send(msg, strlen(msg));
+    send(sockfd, msg, strlen(msg), 0);
     
     char buf[1024];
-    int len = sys_tcp_recv(buf, 1023);
+    int len = recv(sockfd, buf, 1023, 0);
     if (len > 0) {
         buf[len] = 0;
         printf("Received: %s\n", buf);
     }
-    sys_tcp_close();
+    close(sockfd);
 }
 
 static void cmd_curl(const char* url) {
@@ -153,14 +166,26 @@ static void cmd_curl(const char* url) {
     hostname[i] = 0;
     
     net_ipv4_address_t ip;
-    if (sys_dns_lookup(hostname, &ip) != 0) {
+    if (dns_lookup(hostname, &ip) != 0) {
         printf("Failed to resolve %s\n", hostname);
         return;
     }
     
     printf("Connecting to %s (", hostname); print_ip(&ip); printf("):80...\n");
-    if (sys_tcp_connect(&ip, 80) != 0) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        printf("Failed to create socket.\n");
+        return;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(80);
+    memcpy(&addr.sin_addr, &ip, 4);
+    
+    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         printf("Failed to connect to %s:80\n", hostname);
+        close(sockfd);
         return;
     }
     
@@ -182,12 +207,12 @@ static void cmd_curl(const char* url) {
     p = r3; while(*p) request[req_len++] = *p++;
     request[req_len] = 0;
 
-    sys_tcp_send(request, req_len);
+    send(sockfd, request, req_len, 0);
     
     char buf[4096];
     int total = 0;
     while (1) {
-        int len = sys_tcp_recv(buf, 4095);
+        int len = recv(sockfd, buf, 4095, 0);
         if (len < 0) {
             printf("\n[Error: Connection error]\n");
             break;
@@ -201,7 +226,7 @@ static void cmd_curl(const char* url) {
             break;
         }
     }
-    sys_tcp_close();
+    close(sockfd);
 }
 
 static void cmd_ping(const char* host) {
@@ -213,7 +238,7 @@ static void cmd_ping(const char* host) {
     printf("Pinging %s (", host); print_ip(&ip); printf(")...\n");
     int successful = 0;
     for (int i = 0; i < 4; i++) {
-        int rtt = sys_icmp_ping(&ip);
+        int rtt = icmp_ping(&ip);
         if (rtt >= 0) {
             printf("64 bytes from "); print_ip(&ip);
             printf(": icmp_seq=%d time=%dms\n", i + 1, rtt);
@@ -355,8 +380,7 @@ int main(int argc, char** argv) {
         else cmd_ping(argv[2]);
     } else if (strcmp(argv[1], "info") == 0) cmd_netinfo();
     else if (strcmp(argv[1], "unlock") == 0) {
-        sys_network_force_unlock();
-        printf("Network processing lock cleared.\n");
+        printf("Network processing lock cleared (unlocked by default).\n");
     } else printf("Unknown command: %s\n", argv[1]);
     
     return 0;

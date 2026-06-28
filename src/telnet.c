@@ -7,6 +7,12 @@
 #include <unistd.h>
 #include <bearssl.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <fcntl.h>
+#include <errno.h>
+
+static int conn_fd = -1;
+
 static uint32_t rtc_to_days_since_1970(int y, int m, int d) {
     static const int days_before_month[] = {
         0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
@@ -360,7 +366,7 @@ static void telnet_send(const uint8_t *data, int len) {
             }
         }
     } else {
-        sys_tcp_send(data, len);
+        send(conn_fd, data, len, 0);
     }
 }
 
@@ -628,7 +634,7 @@ static int telnet_tls_step(br_ssl_client_context *sc) {
         size_t len;
         unsigned char *buf = br_ssl_engine_sendrec_buf(&sc->eng, &len);
         if (len > 0) {
-            int r = sys_tcp_send(buf, (int)len);
+            int r = send(conn_fd, buf, len, 0);
             if (r > 0) {
                 br_ssl_engine_sendrec_ack(&sc->eng, r);
                 active = 1;
@@ -644,13 +650,21 @@ static int telnet_tls_step(br_ssl_client_context *sc) {
         if (len > 0) {
             uint8_t temp[2048];
             size_t max_read = len > sizeof(temp) ? sizeof(temp) : len;
-            int r = sys_tcp_recv_nb(temp, (int)max_read);
+            int flags = fcntl(conn_fd, F_GETFL, 0);
+            fcntl(conn_fd, F_SETFL, flags | O_NONBLOCK);
+            int r = recv(conn_fd, temp, max_read, 0);
+            fcntl(conn_fd, F_SETFL, flags);
+            if (r < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    r = 0;
+                } else {
+                    return -1; // TCP error
+                }
+            }
             if (r > 0) {
                 memcpy(buf, temp, r);
                 br_ssl_engine_recvrec_ack(&sc->eng, r);
                 active = 1;
-            } else if (r < 0) {
-                return -1; // TCP error
             }
         }
     }
@@ -756,15 +770,28 @@ int main(int argc, char **argv) {
     net_ipv4_address_t ip;
     if (parse_ip(host, &ip) != 0) {
         printf("Resolving %s...\n", host);
-        if (sys_dns_lookup(host, &ip) != 0) {
+        if (dns_lookup(host, &ip) != 0) {
             printf("Failed to resolve: %s\n", host);
             return 1;
         }
     }
 
     printf("Connecting to %s:%d...\n", host, port);
-    if (sys_tcp_connect(&ip, (uint16_t)port) != 0) {
+    conn_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (conn_fd < 0) {
+        printf("Socket creation failed.\n");
+        return 1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    memcpy(&addr.sin_addr, &ip, 4);
+
+    if (connect(conn_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         printf("Connection failed.\n");
+        close(conn_fd);
+        conn_fd = -1;
         return 1;
     }
     printf("Connected. Press Ctrl+] to disconnect.\n\n");
@@ -794,7 +821,7 @@ int main(int argc, char **argv) {
             int dt[6];
             uint32_t days = 719528;
             uint32_t seconds = 0;
-            if (sys_system(SYSTEM_CMD_RTC_GET, (uint64_t)dt, 0, 0, 0) == 0) {
+            if (rtc_get(dt) == 0) {
                 if (dt[0] >= 1970 && dt[1] >= 1 && dt[1] <= 12 && dt[2] >= 1 && dt[2] <= 31) {
                     days = rtc_to_days_since_1970(dt[0], dt[1], dt[2]) + 719528;
                     seconds = dt[3] * 3600 + dt[4] * 60 + dt[5];
@@ -814,10 +841,10 @@ int main(int argc, char **argv) {
             seed[3] = get_rdrand();
         } else {
             printf("Warning: CPU RDRAND unsupported! Seeding secure DRBG with system ticks and RTC fallback...\n");
-            seed[0] = sys_system(SYSTEM_CMD_GET_TICKS, 0, 0, 0, 0);
+            seed[0] = get_ticks();
             seed[1] = (uintptr_t)&sc;
             seed[2] = get_rdtsc();
-            seed[3] = sys_system(SYSTEM_CMD_RTC_GET, 0, 0, 0, 0);
+            seed[3] = rtc_get(NULL);
         }
         br_ssl_engine_inject_entropy(&sc.eng, seed, sizeof(seed));
 
@@ -826,7 +853,7 @@ int main(int argc, char **argv) {
 
         if (br_ssl_client_reset(&sc, host, 0) == 0) {
             printf("\n[Error: SSL client reset failed]\n");
-            sys_tcp_close();
+            close(conn_fd); conn_fd = -1;;
             free_dynamic_certs();
             return 1;
         }
@@ -863,14 +890,21 @@ int main(int argc, char **argv) {
                 break;
             }
             if (r == 0 && !keyboard_active) {
-                sys_system(SYSTEM_CMD_SLEEP, 10, 0, 0, 0);
+                sleep(10);
             }
         } else {
-            int len = sys_tcp_recv_nb(recv_buf, sizeof(recv_buf) - 1);
+            int flags = fcntl(conn_fd, F_GETFL, 0);
+            fcntl(conn_fd, F_SETFL, flags | O_NONBLOCK);
+            int len = recv(conn_fd, recv_buf, sizeof(recv_buf) - 1, 0);
+            fcntl(conn_fd, F_SETFL, flags);
             if (len < 0) {
-                printf("\r\n[Connection error]\r\n");
-                connected = 0;
-                break;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    len = 0;
+                } else {
+                    printf("\r\n[Connection error]\r\n");
+                    connected = 0;
+                    break;
+                }
             }
             if (len == 0) {
                 idle_count++;
@@ -880,7 +914,7 @@ int main(int argc, char **argv) {
                     break;
                 }
                 if (!keyboard_active) {
-                    sys_system(SYSTEM_CMD_SLEEP, 10, 0, 0, 0);
+                    sleep(10);
                 }
                 continue;
             }
@@ -900,7 +934,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    sys_tcp_close();
+    close(conn_fd); conn_fd = -1;;
     free_dynamic_certs();
     printf("\r\n[Telnet session ended]\r\n");
     return 0;

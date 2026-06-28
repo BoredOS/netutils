@@ -29,7 +29,7 @@ static int parse_ip(const char* str, net_ipv4_address_t* ip) {
 
 static int resolve_host(const char* host, net_ipv4_address_t* ip) {
     if (parse_ip(host, ip) == 0) return 0;
-    return sys_dns_lookup(host, ip);
+    return dns_lookup(host, ip);
 }
 
 int main(int argc, char **argv) {
@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
     
     int successful = 0;
     for (int i = 0; i < 4; i++) {
-        int rtt = sys_icmp_ping(&ip);
+        int rtt = icmp_ping(&ip);
         if (rtt >= 0) {
             printf("64 bytes from %d.%d.%d.%d: icmp_seq=%d time=%dms\n", 
                    ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3], i + 1, rtt);

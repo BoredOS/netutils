@@ -9,6 +9,8 @@
 #include <termios.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdbool.h>
+#include <sys/socket.h>
 
 #ifndef STDIN_FILENO
 #define STDIN_FILENO 0
@@ -23,60 +25,58 @@ static void restore_quit_input(void) {
         return;
     }
 
-    if (original_flags >= 0) {
-        fcntl(STDIN_FILENO, F_SETFL, original_flags);
-    }
-
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios);
+    tcsetattr(STDIN_FILENO, TCSANOW, &original_termios);
+    fcntl(STDIN_FILENO, F_SETFL, original_flags);
+    quit_input_ready = 0;
 }
 
-static int enable_quit_input(void) {
+static void enable_quit_input(void) {
     if (quit_input_ready) {
-        return 0;
+        return;
     }
 
-    if (tcgetattr(STDIN_FILENO, &original_termios) == 0) {
-        struct termios raw = original_termios;
-        raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-        raw.c_oflag &= ~(OPOST);
-        raw.c_cflag |= (CS8);
-        raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-        raw.c_cc[VMIN] = 0;
-        raw.c_cc[VTIME] = 0;
-        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) {
-            return -1;
-        }
-        original_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-        if (original_flags >= 0) {
-            fcntl(STDIN_FILENO, F_SETFL, original_flags | O_NONBLOCK);
-        }
-        quit_input_ready = 1;
-        atexit(restore_quit_input);
-        return 0;
+    if (tcgetattr(STDIN_FILENO, &original_termios) < 0) {
+        return;
     }
 
-    return -1;
+    struct termios raw = original_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0) {
+        return;
+    }
+
+    original_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, original_flags | O_NONBLOCK);
+
+    atexit(restore_quit_input);
+    quit_input_ready = 1;
 }
 
 static int poll_quit_key(void) {
-    unsigned char ch;
-    int n = read(STDIN_FILENO, &ch, 1);
-    if (n == 1) {
-        return ch == 'q';
+    char ch;
+    if (read(STDIN_FILENO, &ch, 1) > 0) {
+        if (ch == 'q' || ch == 'Q') {
+            return 1;
+        }
     }
     return 0;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char *argv[]) {
     int port = 80;
-    const char* single_file = NULL;
+    const char *single_file = NULL;
 
-    for (int idx = 1; idx < argc; idx++) {
-        char *arg = argv[idx];
-        int is_numeric = 1;
-        for (int i = 0; arg[i] != '\0'; i++) {
-            if (arg[i] < '0' || arg[i] > '9') {
-                is_numeric = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            printf("Usage: httpd [port] [file_to_serve_always]\n");
+            return 0;
+        }
+        
+        bool is_numeric = true;
+        for (int j = 0; arg[j]; j++) {
+            if (arg[j] < '0' || arg[j] > '9') {
+                is_numeric = false;
                 break;
             }
         }
@@ -97,8 +97,27 @@ int main(int argc, char** argv) {
         printf("[httpd] Dynamic path resolution mode (defaulting to '/Library/AppData/org.boredos.httpd/index.html')\n");
     }
 
-    if (sys_tcp_listen((uint16_t)port) < 0) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        printf("[httpd] Error: Failed to create socket\n");
+        return 1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        printf("[httpd] Error: Failed to bind to port %d\n", port);
+        close(server_fd);
+        return 1;
+    }
+
+    if (listen(server_fd, 5) < 0) {
         printf("[httpd] Error: Failed to listen on port %d\n", port);
+        close(server_fd);
         return 1;
     }
 
@@ -112,21 +131,18 @@ int main(int argc, char** argv) {
             break;
         }
 
-        int accept_res = sys_tcp_accept();
-        if (accept_res < 0) {
-            if (accept_res == -2) {
-                continue;
-            }
+        int client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd < 0) {
             printf("[httpd] Warning: Accept failed, retrying...\n");
-            sys_yield();
+            sched_yield();
             continue;
         }
 
         char req_buf[2048];
         memset(req_buf, 0, sizeof(req_buf));
-        int bytes_read = sys_tcp_recv(req_buf, sizeof(req_buf) - 1);
+        int bytes_read = recv(client_fd, req_buf, sizeof(req_buf) - 1, 0);
         if (bytes_read <= 0) {
-            sys_tcp_close();
+            close(client_fd);
             continue;
         }
 
@@ -136,17 +152,16 @@ int main(int argc, char** argv) {
         
         int parsed = sscanf(req_buf, "%15s %255s %15s", method, path, proto);
         if (parsed < 2) {
-            // Bad request
             char *resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            sys_tcp_send(resp, strlen(resp));
-            sys_tcp_close();
+            send(client_fd, resp, strlen(resp), 0);
+            close(client_fd);
             continue;
         }
 
         if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
             char *resp = "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            sys_tcp_send(resp, strlen(resp));
-            sys_tcp_close();
+            send(client_fd, resp, strlen(resp), 0);
+            close(client_fd);
             continue;
         }
 
@@ -173,8 +188,8 @@ int main(int argc, char** argv) {
                                     "Content-Length: %zu\r\n"
                                     "Connection: close\r\n\r\n"
                                     "%s", strlen(body), body);
-            sys_tcp_send(resp, (size_t)resp_len);
-            sys_tcp_close();
+            send(client_fd, resp, (size_t)resp_len, 0);
+            close(client_fd);
             continue;
         }
 
@@ -189,17 +204,18 @@ int main(int argc, char** argv) {
                             "Content-Type: text/html\r\n"
                             "Content-Length: %ld\r\n"
                             "Connection: close\r\n\r\n", size);
-        sys_tcp_send(header_buf, strlen(header_buf));
+        send(client_fd, header_buf, strlen(header_buf), 0);
 
         char file_buf[1024];
         size_t n;
         while ((n = fread(file_buf, 1, sizeof(file_buf), f)) > 0) {
-            sys_tcp_send(file_buf, n);
+            send(client_fd, file_buf, n, 0);
         }
 
         fclose(f);
-        sys_tcp_close();
+        close(client_fd);
     }
 
+    close(server_fd);
     return 0;
 }
