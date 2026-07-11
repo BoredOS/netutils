@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Christiaan (chris@boreddev.nl)
 # BoredOS Network Utilities Standalone Makefile
 
-CC = x86_64-elf-gcc
-LD = x86_64-elf-ld
-AR = x86_64-elf-ar
+CC = x86_64-boredos-gcc
+LD = x86_64-boredos-ld
+AR = x86_64-boredos-ar
 
 ifneq ($(BOREDOS_SDK),)
   ifeq ($(wildcard $(BOREDOS_SDK)/lib/libc.a),)
@@ -90,7 +90,7 @@ bup: all
 	if [ -d certs ]; then cp certs/*.pem build/package/config/; fi
 	cp index.html build/package/assets/
 	cp MANIFEST.toml build/package/
-	x86_64-elf-strip --strip-unneeded build/package/bin/*.elf 2>/dev/null || true
+	x86_64-boredos-strip --strip-unneeded build/package/bin/*.elf 2>/dev/null || true
 	tar -cf build/netutils.tar -C build/package MANIFEST.toml bin config assets
 	lz4 -f build/netutils.tar build/netutils.bup
 	rm -f build/netutils.tar
