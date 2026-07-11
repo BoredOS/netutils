@@ -9,6 +9,8 @@
 #include <string.h>
 #include <bearssl.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 static int conn_fd = -1;
 

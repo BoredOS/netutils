@@ -11,6 +11,8 @@
 #include <string.h>
 #include <stdbool.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #ifndef STDIN_FILENO
 #define STDIN_FILENO 0

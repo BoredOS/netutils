@@ -38,10 +38,10 @@ LDFLAGS = -m elf_x86_64 -nostdlib -static -no-pie -Ttext=0x40000000 \
 UTILS = ping telnet curl net httpd
 APPS  = $(patsubst %, %.elf, $(UTILS))
 
-all: bootstrap-bearssl bootstrap-sdk
+all: bootstrap-bearssl
 	$(MAKE) apps
 
-.PHONY: bootstrap-bearssl bootstrap-sdk apps
+.PHONY: bootstrap-bearssl apps
 
 bootstrap-bearssl:
 	@if [ ! -d "$(BEARSSL_DIR)" ]; then \
@@ -49,33 +49,16 @@ bootstrap-bearssl:
 		git clone https://www.bearssl.org/git/BearSSL $(BEARSSL_DIR); \
 	fi
 
-bootstrap-sdk:
-ifdef BOOTSTRAP_SDK
-	@if [ ! -f "$(BOOTSTRAP_SDK)/lib/libc.a" ]; then \
-		if [ -d "../libc" ]; then \
-			echo "[STANDALONE] Peer libc found at ../libc. Building standard SDK..."; \
-			$(MAKE) -C ../libc SDK_DIR=$(BOOTSTRAP_SDK) install; \
-		else \
-			echo "[STANDALONE] SDK and peer libc not found. Fetching libc from GitHub..."; \
-			mkdir -p build; \
-			if [ ! -d "build/libc_src" ]; then \
-				git clone https://github.com/boredos/libc.git build/libc_src; \
-			fi; \
-			$(MAKE) -C build/libc_src SDK_DIR=$(BOOTSTRAP_SDK) install; \
-		fi \
-	fi
-endif
-
 apps: $(APPS)
 
 curl.elf: obj/curl.o obj/libbearssl.a
-	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $< obj/libbearssl.a -lc -o $@
+	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $(SDK_PATH)/lib/crti.o $< obj/libbearssl.a -lc $(SDK_PATH)/lib/crtn.o -o $@
 
 telnet.elf: obj/telnet.o obj/libbearssl.a
-	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $< obj/libbearssl.a -lc -o $@
+	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $(SDK_PATH)/lib/crti.o $< obj/libbearssl.a -lc $(SDK_PATH)/lib/crtn.o -o $@
 
 %.elf: obj/%.o
-	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $< -lc -o $@
+	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $(SDK_PATH)/lib/crti.o $< -lc $(SDK_PATH)/lib/crtn.o -o $@
 
 obj/bearssl/%.o: $(BEARSSL_DIR)/src/%.c
 	@mkdir -p $(dir $@)
@@ -107,7 +90,7 @@ bup: all
 	if [ -d certs ]; then cp certs/*.pem build/package/config/; fi
 	cp index.html build/package/assets/
 	cp MANIFEST.toml build/package/
-	mkdir -p build
+	x86_64-elf-strip --strip-unneeded build/package/bin/*.elf 2>/dev/null || true
 	tar -cf build/netutils.tar -C build/package MANIFEST.toml bin config assets
 	lz4 -f build/netutils.tar build/netutils.bup
 	rm -f build/netutils.tar

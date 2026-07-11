@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <stdbool.h>
 
 static void print_ip(const net_ipv4_address_t* ip) {
