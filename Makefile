@@ -2,24 +2,7 @@
 # BoredOS Network Utilities Standalone Makefile
 
 CC = x86_64-boredos-gcc
-LD = x86_64-boredos-ld
 AR = x86_64-boredos-ar
-
-ifneq ($(BOREDOS_SDK),)
-  ifeq ($(wildcard $(BOREDOS_SDK)/lib/libc.a),)
-    BOOTSTRAP_SDK = $(BOREDOS_SDK)
-    SDK_PATH      = $(BOREDOS_SDK)
-  else
-    SDK_PATH      = $(BOREDOS_SDK)
-  endif
-endif
-
-ifeq ($(SDK_PATH),)
-  SDK_PATH = $(abspath build/sdk)
-  ifeq ($(wildcard $(SDK_PATH)/lib/libc.a),)
-    BOOTSTRAP_SDK = $(SDK_PATH)
-  endif
-endif
 
 DESTDIR ?= $(abspath build/dist)
 
@@ -29,11 +12,10 @@ BEARSSL_OBJS = $(patsubst $(BEARSSL_DIR)/src/%.c, obj/bearssl/%.o, $(BEARSSL_SRC
 
 CFLAGS  = -Wall -Wextra -std=gnu11 -ffreestanding -O2 -fno-stack-protector \
           -fno-stack-check -fno-lto -fno-pie -m64 -march=x86-64 -mno-red-zone \
-          -isystem $(SDK_PATH)/include -I$(BEARSSL_DIR)/inc -I$(BEARSSL_DIR)/src
+          -I$(BEARSSL_DIR)/inc -I$(BEARSSL_DIR)/src
 
-LDFLAGS = -m elf_x86_64 -nostdlib -static -no-pie -Ttext=0x40000000 \
-          --no-dynamic-linker -z text -z max-page-size=0x1000 -e _start \
-          -L$(SDK_PATH)/lib
+LDFLAGS = -static -no-pie -Wl,-Ttext=0x40000000 \
+          -Wl,--no-dynamic-linker -Wl,-z,text -Wl,-z,max-page-size=0x1000
 
 UTILS = ping telnet curl net httpd
 APPS  = $(patsubst %, %.elf, $(UTILS))
@@ -52,13 +34,13 @@ bootstrap-bearssl:
 apps: $(APPS)
 
 curl.elf: obj/curl.o obj/libbearssl.a
-	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $(SDK_PATH)/lib/crti.o $< obj/libbearssl.a -lc $(SDK_PATH)/lib/crtn.o -o $@
+	$(CC) $< obj/libbearssl.a $(LDFLAGS) -o $@
 
 telnet.elf: obj/telnet.o obj/libbearssl.a
-	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $(SDK_PATH)/lib/crti.o $< obj/libbearssl.a -lc $(SDK_PATH)/lib/crtn.o -o $@
+	$(CC) $< obj/libbearssl.a $(LDFLAGS) -o $@
 
 %.elf: obj/%.o
-	$(LD) $(LDFLAGS) $(SDK_PATH)/lib/crt0.o $(SDK_PATH)/lib/crti.o $< -lc $(SDK_PATH)/lib/crtn.o -o $@
+	$(CC) $< $(LDFLAGS) -o $@
 
 obj/bearssl/%.o: $(BEARSSL_DIR)/src/%.c
 	@mkdir -p $(dir $@)
