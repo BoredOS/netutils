@@ -870,7 +870,7 @@ int main(int argc, char **argv) {
 
     while (connected) {
         char ch = 0;
-        int got = sys_tty_read_in(&ch, 1);
+        int got = read(0, &ch, 1);
         int keyboard_active = 0;
 
         if (got > 0) {
