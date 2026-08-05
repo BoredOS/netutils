@@ -1,36 +1,34 @@
 // Copyright (c) 2023-2026 Christiaan (chris@boreddev.nl)
 // This software is released under the GNU General Public License v3.0. See LICENSE file for details.
 // This header needs to maintain in any file it is present in, as per the GPL license terms.
-#include <stdlib.h>
-#include <syscall.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
-static int parse_ip(const char* str, net_ipv4_address_t* ip) {
-    int val = 0;
-    int part = 0;
-    const char* p = str;
-    while (*p) {
-        if (*p >= '0' && *p <= '9') {
-            val = val * 10 + (*p - '0');
-            if (val > 255) return -1;
-        } else if (*p == '.') {
-            if (part > 3) return -1;
-            ip->bytes[part++] = (uint8_t)val;
-            val = 0;
-        } else {
-            return -1;
-        }
-        p++;
-    }
-    if (part != 3) return -1;
-    ip->bytes[3] = (uint8_t)val;
-    return 0;
-}
+struct icmp_header {
+    uint8_t  type;
+    uint8_t  code;
+    uint16_t checksum;
+    uint16_t id;
+    uint16_t sequence;
+};
 
-static int resolve_host(const char* host, net_ipv4_address_t* ip) {
-    if (parse_ip(host, ip) == 0) return 0;
-    return dns_lookup(host, ip);
+static uint16_t calculate_checksum(void *b, int len) {
+    uint16_t *buf = (uint16_t *)b;
+    uint32_t sum = 0;
+    for (sum = 0; len > 1; len -= 2)
+        sum += *buf++;
+    if (len == 1)
+        sum += *(uint8_t *)buf;
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return (uint16_t)(~sum);
 }
 
 int main(int argc, char **argv) {
@@ -38,56 +36,87 @@ int main(int argc, char **argv) {
         printf("Usage: ping <host>\n");
         return 1;
     }
-    
-    char status_buf[256];
-    FILE* f = fopen("/sys/class/net/eth0/status", "r");
-    bool is_init = false;
-    if (f) {
-        int len = fread(status_buf, 1, 255, f);
-        fclose(f);
-        if (len > 0) {
-            status_buf[len] = 0;
-            if (strstr(status_buf, "initialized: 1") != NULL) {
-                is_init = true;
-            }
-        }
-    }
-    
-    if (!is_init) {
-        printf("Initializing network...\n");
-        FILE* ctrl = fopen("/sys/class/net/eth0/control", "w");
-        if (ctrl) {
-            fwrite("init", 1, 4, ctrl);
-            fclose(ctrl);
-        }
-    }
-    
+
     const char *host = argv[1];
-    net_ipv4_address_t ip;
-    
-    if (resolve_host(host, &ip) != 0) {
-        printf("Failed to resolve %s\n", host);
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+
+    if (inet_pton(AF_INET, host, &dest.sin_addr) <= 0) {
+        struct hostent *he = gethostbyname(host);
+        if (!he || !he->h_addr_list[0]) {
+            printf("ping: cannot resolve %s: Unknown host\n", host);
+            return 1;
+        }
+        memcpy(&dest.sin_addr, he->h_addr_list[0], sizeof(dest.sin_addr));
+    }
+
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &dest.sin_addr, ip_str, sizeof(ip_str));
+
+    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (s < 0) {
+        // Fallback to SOCK_RAW if DGRAM is not permitted
+        s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    }
+    if (s < 0) {
+        perror("ping: socket");
         return 1;
     }
-    
-    printf("Pinging %s (%d.%d.%d.%d)...\n", host, ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3]);
-    
+
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    printf("PING %s (%s): 56 data bytes\n", host, ip_str);
+
     int successful = 0;
-    for (int i = 0; i < 4; i++) {
-        int rtt = icmp_ping(&ip);
-        if (rtt >= 0) {
-            printf("64 bytes from %d.%d.%d.%d: icmp_seq=%d time=%dms\n", 
-                   ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3], i + 1, rtt);
+    pid_t pid = getpid() & 0xFFFF;
+
+    for (int seq = 1; seq <= 4; seq++) {
+        char packet[64];
+        memset(packet, 0, sizeof(packet));
+
+        struct icmp_header *icmp = (struct icmp_header *)packet;
+        icmp->type = 8; // ICMP Echo Request
+        icmp->code = 0;
+        icmp->id = htons(pid);
+        icmp->sequence = htons(seq);
+        icmp->checksum = 0;
+        icmp->checksum = calculate_checksum(packet, sizeof(packet));
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        ssize_t sent = sendto(s, packet, sizeof(packet), 0, (struct sockaddr *)&dest, sizeof(dest));
+        if (sent < 0) {
+            printf("Request timeout for icmp_seq %d\n", seq);
+            if (seq < 4) sleep(1);
+            continue;
+        }
+
+        char recv_buf[128];
+        struct sockaddr_in from;
+        socklen_t from_len = sizeof(from);
+
+        ssize_t recvd = recvfrom(s, recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&from, &from_len);
+        clock_gettime(CLOCK_MONOTONIC, &end);
+
+        if (recvd >= 0) {
+            long rtt_ms = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+            printf("64 bytes from %s: icmp_seq=%d time=%ldms\n", ip_str, seq, rtt_ms);
             successful++;
         } else {
-            printf("Request timeout for icmp_seq %d\n", i + 1);
+            printf("Request timeout for icmp_seq %d\n", seq);
         }
-        // Small delay between pings
-        for(volatile int d=0; d<1000000; d++);
+
+        if (seq < 4) sleep(1);
     }
-    
+
+    close(s);
     printf("\n--- %s ping statistics ---\n", host);
-    printf("4 packets transmitted, %d received, %d%% packet loss\n", successful, (4-successful)*25);
-    
+    printf("4 packets transmitted, %d received, %d%% packet loss\n", successful, (4 - successful) * 25);
+
     return successful > 0 ? 0 : 1;
 }
