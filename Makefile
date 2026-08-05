@@ -17,7 +17,7 @@ CFLAGS  = -Wall -Wextra -std=gnu11 -ffreestanding -O2 -fno-stack-protector \
 LDFLAGS = -static -no-pie -Wl,-Ttext=0x40000000 \
           -Wl,--no-dynamic-linker -Wl,-z,text -Wl,-z,max-page-size=0x1000
 
-UTILS = ping telnet curl net httpd
+UTILS = ifconfig ping ping6 dhclient route telnet curl httpd dig hostname speedtest
 APPS  = $(patsubst %, %.elf, $(UTILS))
 
 all: bootstrap-bearssl
