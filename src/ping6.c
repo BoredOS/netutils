@@ -11,7 +11,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
-struct icmp_header {
+struct icmp6_header {
     uint8_t  type;
     uint8_t  code;
     uint16_t checksum;
@@ -19,57 +19,40 @@ struct icmp_header {
     uint16_t sequence;
 };
 
-static uint16_t calculate_checksum(void *b, int len) {
-    uint16_t *buf = (uint16_t *)b;
-    uint32_t sum = 0;
-    for (sum = 0; len > 1; len -= 2)
-        sum += *buf++;
-    if (len == 1)
-        sum += *(uint8_t *)buf;
-    sum = (sum >> 16) + (sum & 0xFFFF);
-    sum += (sum >> 16);
-    return (uint16_t)(~sum);
-}
-
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("Usage: ping <host>\n");
+        printf("Usage: ping6 <host>\n");
         return 1;
     }
 
     const char *host = argv[1];
-    struct sockaddr_in dest;
+    struct sockaddr_in6 dest;
     memset(&dest, 0, sizeof(dest));
-    dest.sin_family = AF_INET;
+    dest.sin6_family = AF_INET6;
 
-    if (inet_pton(AF_INET, host, &dest.sin_addr) <= 0) {
-        struct hostent *he = gethostbyname(host);
-        if (!he || !he->h_addr_list[0]) {
-            printf("ping: cannot resolve %s: Unknown host\n", host);
-            return 1;
-        }
-        memcpy(&dest.sin_addr, he->h_addr_list[0], sizeof(dest.sin_addr));
+    if (inet_pton(AF_INET6, host, &dest.sin6_addr) <= 0) {
+        printf("ping6: invalid IPv6 address %s\n", host);
+        return 1;
     }
 
-    char ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &dest.sin_addr, ip_str, sizeof(ip_str));
+    char ip_str[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &dest.sin6_addr, ip_str, sizeof(ip_str));
 
-    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
     if (s < 0) {
-        // Fallback to SOCK_RAW if DGRAM is not permitted
-        s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+        s = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
     }
     if (s < 0) {
-        perror("ping: socket");
+        perror("ping6: socket");
         return 1;
     }
 
     struct timeval tv;
     tv.tv_sec = 1;
     tv.tv_usec = 0;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, 20, &tv, sizeof(tv));
 
-    printf("PING %s (%s): 56 data bytes\n", host, ip_str);
+    printf("PING6 %s (%s): 56 data bytes\n", host, ip_str);
 
     int successful = 0;
     pid_t pid = getpid() & 0xFFFF;
@@ -78,26 +61,25 @@ int main(int argc, char **argv) {
         char packet[64];
         memset(packet, 0, sizeof(packet));
 
-        struct icmp_header *icmp = (struct icmp_header *)packet;
-        icmp->type = 8; // ICMP Echo Request
-        icmp->code = 0;
-        icmp->id = htons(pid);
-        icmp->sequence = htons(seq);
-        icmp->checksum = 0;
-        icmp->checksum = calculate_checksum(packet, sizeof(packet));
+        struct icmp6_header *icmp6 = (struct icmp6_header *)packet;
+        icmp6->type = 128; // ICMPv6 Echo Request
+        icmp6->code = 0;
+        icmp6->id = htons(pid);
+        icmp6->sequence = htons(seq);
+        icmp6->checksum = 0;
 
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
 
         ssize_t sent = sendto(s, packet, sizeof(packet), 0, (struct sockaddr *)&dest, sizeof(dest));
         if (sent < 0) {
-            printf("Request timeout for icmp_seq %d\n", seq);
+            printf("Request timeout for icmp6_seq %d\n", seq);
             if (seq < 4) sleep(1);
             continue;
         }
 
         char recv_buf[128];
-        struct sockaddr_in from;
+        struct sockaddr_in6 from;
         socklen_t from_len = sizeof(from);
 
         ssize_t recvd = recvfrom(s, recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&from, &from_len);
@@ -105,17 +87,17 @@ int main(int argc, char **argv) {
 
         if (recvd >= 0) {
             long rtt_ms = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
-            printf("64 bytes from %s: icmp_seq=%d time=%ldms\n", ip_str, seq, rtt_ms);
+            printf("64 bytes from %s: icmp6_seq=%d time=%ldms\n", ip_str, seq, rtt_ms);
             successful++;
         } else {
-            printf("Request timeout for icmp_seq %d\n", seq);
+            printf("Request timeout for icmp6_seq %d\n", seq);
         }
 
         if (seq < 4) sleep(1);
     }
 
     close(s);
-    printf("\n--- %s ping statistics ---\n", host);
+    printf("\n--- %s ping6 statistics ---\n", host);
     printf("4 packets transmitted, %d received, %d%% packet loss\n", successful, (4 - successful) * 25);
 
     return successful > 0 ? 0 : 1;
