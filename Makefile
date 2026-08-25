@@ -10,12 +10,11 @@ BEARSSL_DIR = ../bearssl
 BEARSSL_SRCS = $(shell find $(BEARSSL_DIR)/src -name "*.c")
 BEARSSL_OBJS = $(patsubst $(BEARSSL_DIR)/src/%.c, obj/bearssl/%.o, $(BEARSSL_SRCS))
 
-CFLAGS  = -Wall -Wextra -std=gnu11 -ffreestanding -O2 -fno-stack-protector \
-          -fno-stack-check -fno-lto -fno-pie -m64 -march=x86-64 -mno-red-zone \
+CFLAGS  = -Wall -Wextra -std=gnu11 -O2 -fno-stack-protector \
+          -fno-stack-check -m64 -march=x86-64 \
           -I$(BEARSSL_DIR)/inc -I$(BEARSSL_DIR)/src
 
-LDFLAGS = -static -no-pie -Wl,-Ttext=0x40000000 \
-          -Wl,--no-dynamic-linker -Wl,-z,text -Wl,-z,max-page-size=0x1000
+LDFLAGS = -Wl,-z,max-page-size=0x1000 -Wl,-dynamic-linker,/usr/lib/ld.so -Wl,-rpath,/usr/lib:/lib -lm
 
 UTILS = ifconfig ping ping6 dhclient route telnet curl httpd dig hostname speedtest
 APPS  = $(patsubst %, %.elf, $(UTILS))
