@@ -64,15 +64,46 @@ static int poll_quit_key(void) {
     return 0;
 }
 
+static bool url_decode(char *dst, const char *src, size_t max_len) {
+    size_t d = 0;
+    for (size_t s = 0; src[s] && d + 1 < max_len; s++) {
+        if (src[s] == '%' && src[s+1] && src[s+2]) {
+            char hex[3] = { src[s+1], src[s+2], 0 };
+            char *endptr = NULL;
+            long val = strtol(hex, &endptr, 16);
+            if (endptr == hex + 2 && val >= 0 && val <= 255) {
+                if (val == 0) return false;
+                dst[d++] = (char)val;
+                s += 2;
+                continue;
+            }
+        }
+        dst[d++] = src[s];
+    }
+    dst[d] = 0;
+    return true;
+}
+
 int main(int argc, char *argv[]) {
     int port = 80;
     const char *single_file = NULL;
+    const char *doc_root = "/Library/WebServer/Documents";
+    bool custom_doc_root = false;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
-            printf("Usage: httpd [port] [file_to_serve_always]\n");
+            printf("Usage: httpd [-p port] [-r doc_root] [port] [file_to_serve_always]\n");
             return 0;
+        }
+        if (strcmp(arg, "-p") == 0 && i + 1 < argc) {
+            port = atoi(argv[++i]);
+            continue;
+        }
+        if (strcmp(arg, "-r") == 0 && i + 1 < argc) {
+            doc_root = argv[++i];
+            custom_doc_root = true;
+            continue;
         }
         
         bool is_numeric = true;
@@ -92,11 +123,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("[httpd] Starting HTTP server on port %d...\n", port);
+    printf("[httpd] Starting HTTP server on port %d (doc_root: %s)...\n", port, doc_root);
     if (single_file) {
         printf("[httpd] Single-file mode: Serving '%s' for all requests\n", single_file);
-    } else {
-        printf("[httpd] Dynamic path resolution mode (defaulting to '/Library/AppData/org.boredos.httpd/index.html')\n");
     }
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -167,21 +196,42 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        const char* file_to_serve = single_file;
+        char *q = strchr(path, '?');
+        if (q) *q = '\0';
+        char *h = strchr(path, '#');
+        if (h) *h = '\0';
+
+        char decoded_path[256];
+        if (!url_decode(decoded_path, path, sizeof(decoded_path))) {
+            char *resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send(client_fd, resp, strlen(resp), 0);
+            close(client_fd);
+            continue;
+        }
+
+        if (strstr(decoded_path, "..")) {
+            char *resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send(client_fd, resp, strlen(resp), 0);
+            close(client_fd);
+            continue;
+        }
+
+        char resolved_file[512];
+        const char *file_to_serve = single_file;
         if (!file_to_serve) {
-            file_to_serve = path;
-            if (strcmp(file_to_serve, "/") == 0) {
-                file_to_serve = "/Library/AppData/org.boredos.httpd/index.html";
-            }
+            const char *req_path = (strcmp(decoded_path, "/") == 0) ? "/index.html" : decoded_path;
+            snprintf(resolved_file, sizeof(resolved_file), "%s%s", doc_root, req_path);
+            file_to_serve = resolved_file;
         }
 
         FILE *f = fopen(file_to_serve, "rb");
-        if (!f && file_to_serve[0] == '/') {
-            f = fopen(file_to_serve + 1, "rb");
+        if (!f && !single_file && !custom_doc_root && strcmp(decoded_path, "/") == 0) {
+            file_to_serve = "/Library/AppData/org.boredos.httpd/index.html";
+            f = fopen(file_to_serve, "rb");
         }
 
         if (!f) {
-            printf("[httpd] GET %s -> 404 Not Found\n", path);
+            printf("[httpd] GET %s -> 404 Not Found\n", decoded_path);
             const char *body = "<html><body><h1 style='color:#ff3366;'>404 Not Found</h1><p>The requested file was not found.</p></body></html>";
             char resp[256];
             int resp_len = snprintf(resp, sizeof(resp),

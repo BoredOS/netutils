@@ -179,8 +179,14 @@ int main(int argc, char **argv) {
             ifc.ifc_len = sizeof(buf);
             ifc.ifc_buf = buf;
             if (ioctl(s, SIOCGIFCONF, &ifc) == 0 && ifc.ifc_len > 0) {
+                int count = ifc.ifc_len / sizeof(struct ifreq_custom);
                 struct ifreq_custom *ifr = (struct ifreq_custom *)buf;
-                strncpy(auto_ifname, ifr[0].ifr_name, sizeof(auto_ifname) - 1);
+                for (int i = 0; i < count; i++) {
+                    if (strncmp(ifr[i].ifr_name, "lo", 2) != 0) {
+                        strncpy(auto_ifname, ifr[i].ifr_name, sizeof(auto_ifname) - 1);
+                        break;
+                    }
+                }
             }
             close(s);
         }

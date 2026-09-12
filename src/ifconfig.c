@@ -127,11 +127,19 @@ int main(int argc, char **argv) {
     }
 
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "up") == 0) {
+        if (strcmp(argv[i], "inet") == 0 || strcmp(argv[i], "inet4") == 0) {
+            continue;
+        } else if (strcmp(argv[i], "up") == 0) {
             struct ifreq_custom ifr;
             memset(&ifr, 0, sizeof(ifr));
             strncpy(ifr.ifr_name, ifname, 15);
             ifr.ifr_flags = 0x1 | 0x2 | 0x40; // IFF_UP | IFF_BROADCAST | IFF_RUNNING
+            ioctl(s, SIOCSIFFLAGS, &ifr);
+        } else if (strcmp(argv[i], "down") == 0) {
+            struct ifreq_custom ifr;
+            memset(&ifr, 0, sizeof(ifr));
+            strncpy(ifr.ifr_name, ifname, 15);
+            ifr.ifr_flags = 0;
             ioctl(s, SIOCSIFFLAGS, &ifr);
         } else if (strcmp(argv[i], "netmask") == 0 && i + 1 < argc) {
             struct ifreq_custom ifr;
