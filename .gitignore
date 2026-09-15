@@ -4,3 +4,16 @@ build/
 *.a
 *.o
 .DS_Store
+
+/curl
+/dhclient
+/dig
+/hostname
+/httpd
+/ifconfig
+/ping
+/ping6
+/route
+/sntp
+/speedtest
+/telnet

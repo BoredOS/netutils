@@ -24,4 +24,4 @@ To stage the compiled executables into your target initrd root filesystem direct
 ```bash
 make DESTDIR=/path/to/initrd/root install
 ```
-- All compiled binaries (`*.elf`) are routed to `/bin/`
+- All compiled binaries are routed to `/bin/`

@@ -17,7 +17,7 @@ CFLAGS  = -Wall -Wextra -std=gnu11 -O2 -fno-stack-protector \
 LDFLAGS = -Wl,-z,max-page-size=0x1000 -Wl,-dynamic-linker,/usr/lib/ld.so -Wl,-rpath,/usr/lib:/lib -lm
 
 UTILS = ifconfig ping ping6 dhclient route telnet curl httpd dig hostname speedtest sntp
-APPS  = $(patsubst %, %.elf, $(UTILS))
+APPS  = $(UTILS)
 
 all: bootstrap-bearssl
 	$(MAKE) apps
@@ -32,13 +32,13 @@ bootstrap-bearssl:
 
 apps: $(APPS)
 
-curl.elf: obj/curl.o obj/libbearssl.a
+curl: obj/curl.o obj/libbearssl.a
 	$(CC) $< obj/libbearssl.a $(LDFLAGS) -o $@
 
-telnet.elf: obj/telnet.o obj/libbearssl.a
+telnet: obj/telnet.o obj/libbearssl.a
 	$(CC) $< obj/libbearssl.a $(LDFLAGS) -o $@
 
-%.elf: obj/%.o
+%: obj/%.o
 	$(CC) $< $(LDFLAGS) -o $@
 
 obj/bearssl/%.o: $(BEARSSL_DIR)/src/%.c
@@ -71,7 +71,7 @@ bup: all
 	if [ -d certs ]; then cp certs/*.pem build/package/config/; fi
 	cp index.html build/package/assets/
 	cp MANIFEST.toml build/package/
-	x86_64-boredos-strip --strip-unneeded build/package/bin/*.elf 2>/dev/null || true
+	x86_64-boredos-strip --strip-unneeded build/package/bin/* 2>/dev/null || true
 	tar -cf build/netutils.tar -C build/package MANIFEST.toml bin config assets
 	lz4 -f build/netutils.tar build/netutils.bup
 	rm -f build/netutils.tar

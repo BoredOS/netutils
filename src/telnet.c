@@ -169,19 +169,11 @@ static int clone_pkey(br_x509_pkey *dst, const br_x509_pkey *src) {
     return 0;
 }
 
-static void load_dynamic_certs(void) {
+static void load_certs_from_dir(const char *dir_path, size_t *ta_capacity) {
     FAT32_FileInfo *entries = malloc(sizeof(FAT32_FileInfo) * 128);
     if (!entries) return;
-    int count = sys_list("/Library/Certificates", entries, 128);
+    int count = sys_list(dir_path, entries, 128);
     if (count <= 0) {
-        printf("No certificates found in /Library/Certificates or folder missing.\n");
-        free(entries);
-        return;
-    }
-
-    size_t ta_capacity = 8;
-    dynamic_TAs = malloc(ta_capacity * sizeof(br_x509_trust_anchor));
-    if (!dynamic_TAs) {
         free(entries);
         return;
     }
@@ -196,8 +188,7 @@ static void load_dynamic_certs(void) {
         }
 
         char path[512];
-        strcpy(path, "/Library/Certificates/");
-        strcat(path, name);
+        snprintf(path, sizeof(path), "%s/%s", dir_path, name);
 
         int fd = sys_open(path, "r");
         if (fd < 0) {
@@ -258,9 +249,9 @@ static void load_dynamic_certs(void) {
                     int err = br_x509_decoder_last_error(&x509_ctx);
 
                     if (pkey && err == 0 && dn.len > 0) {
-                        if (dynamic_TAs_num >= ta_capacity) {
-                            ta_capacity *= 2;
-                            br_x509_trust_anchor *new_tas = realloc(dynamic_TAs, ta_capacity * sizeof(br_x509_trust_anchor));
+                        if (dynamic_TAs_num >= *ta_capacity) {
+                            *ta_capacity *= 2;
+                            br_x509_trust_anchor *new_tas = realloc(dynamic_TAs, *ta_capacity * sizeof(br_x509_trust_anchor));
                             if (new_tas) {
                                 dynamic_TAs = new_tas;
                             } else {
@@ -295,11 +286,26 @@ static void load_dynamic_certs(void) {
     }
 
     free(entries);
+}
+
+static void load_dynamic_certs(void) {
+    size_t ta_capacity = 8;
+    dynamic_TAs = malloc(ta_capacity * sizeof(br_x509_trust_anchor));
+    if (!dynamic_TAs) return;
+
+    load_certs_from_dir("/Library/Certificates", &ta_capacity);
+
+    const char *home = getenv("HOME");
+    if (home && home[0] && strcmp(home, "/") != 0) {
+        char user_certs[256];
+        snprintf(user_certs, sizeof(user_certs), "%s/Library/Certificates", home);
+        load_certs_from_dir(user_certs, &ta_capacity);
+    }
 
     if (dynamic_TAs_num > 0) {
-        printf("Successfully loaded %d dynamic CA certificates from /Library/Certificates\n", (int)dynamic_TAs_num);
+        printf("Successfully loaded %d dynamic CA certificates\n", (int)dynamic_TAs_num);
     } else {
-        printf("No valid certificates loaded from /Library/Certificates.\n");
+        printf("No valid certificates loaded.\n");
         free(dynamic_TAs);
         dynamic_TAs = NULL;
     }
